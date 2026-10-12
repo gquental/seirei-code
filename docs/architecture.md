@@ -27,6 +27,7 @@ Seirei talks to T3's MCP server over streamable HTTP. The origin comes from `<T3
 - **Titles set at launch are never regenerated,** so a tag in a title is a permanent handle.
 - **A token from `t3 auth session issue` is capped at `approval-required`.** It cannot message or answer a thread running with more autonomy. The pairing-code OAuth flow can grant up to `full-access`, which is why `seirei login` exists.
 - **Tool approvals are invisible to MCP.** The pending-request tools return user-input questions only. A thread waiting on an approval has to be approved in T3's UI.
+- **A launch needs a model.** `t3_thread_launch` without `modelSelection` uses the project's default model, and rejects the launch when the project has none. `orchestrator_capabilities` lists every provider with its models, and a provider that cannot run lists the reasons as `constraints`.
 
 ## Crates
 
@@ -39,12 +40,12 @@ Seirei talks to T3's MCP server over streamable HTTP. The origin comes from `<T3
 Module map:
 
 - `seirei_proto::ids` holds opaque T3 ids, `SendId`, and `T3Time`.
-- `seirei_proto::model` holds projects, thread summaries, lineage, jobs, the coordinator view, questions, and health.
+- `seirei_proto::model` holds projects, thread summaries, model selections, runtime modes and the credential's `Access`, lineage, jobs, the coordinator view, questions, and health.
 - `seirei_proto::timeline` holds timeline items, the open-set `ItemKind`, and the window.
 - `seirei_proto::wire` holds the socket protocol.
 - `seirei::config` decides where configuration and credentials come from.
 - `seirei::t3` is the `T3Api` seam, page sizes, positions, and the error taxonomy. `t3::mcp` speaks MCP over HTTP. `t3::wire` turns T3's JSON into domain types. `t3::login` runs the pairing flow.
-- `seirei::coordinator` decides attribution, the coordinator key and tags, the brief, and the ensure state machine.
+- `seirei::coordinator` decides attribution, the coordinator key and tags, the coordinator's model, the brief, and the ensure state machine.
 - `seirei::project` is one actor per project. It owns the scan, timeline refresh, commands, and publishing.
 - `seirei::server` owns sessions, the handshake, routing, and the actor registry.
 - `seirei_tui::app` is the TUI state machine, `keymap` every binding, and `render` the drawing.
@@ -69,14 +70,17 @@ The only durable state is `<state_dir>/projects/<project>.json`, holding the coo
 Each tick of a project's actor runs these steps:
 
 1. Drop timelines nobody holds.
-2. **Scan.** Page `t3_thread_list` until a page reaches back past the horizon. Pages overlap by five rows, because a thread archived mid-scan shifts later rows up. Every row lands in a map, newest `updatedAt` wins. The horizon starts at the binding's `minted_after` and then tracks the newest `updatedAt` seen. A thread bumped mid-scan jumps above the horizon and is caught next tick.
-3. **Refresh timelines.** Refresh each hot timeline whose list row shows a new `updatedAt`. A refresh reads the newest 100 items and replaces the window whole. Positions shift, so nothing is merged. A second read happens only when the thread grew between the list call and the read.
-4. **Questions.** For `Waiting` threads, list pending question ids and read the new ones.
-5. Publish if the view changed.
+2. **Recover.** When the key has no thread and no lookup has run since the last launch attempt, look up the key's tag and adopt the thread it finds. A tick never launches.
+3. **Scan,** once a coordinator is bound. Page `t3_thread_list` until a page reaches back past the horizon. Pages overlap by five rows, because a thread archived mid-scan shifts later rows up. Every row lands in a map, newest `updatedAt` wins. The horizon starts at the binding's `minted_after` and then tracks the newest `updatedAt` seen. A thread bumped mid-scan jumps above the horizon and is caught next tick.
+4. **Refresh timelines.** Refresh each hot timeline whose list row shows a new `updatedAt`. A refresh reads the newest 100 items and replaces the window whole. Positions shift, so nothing is merged. A second read happens only when the thread grew between the list call and the read.
+5. **Questions.** For `Waiting` threads, list pending question ids and read the new ones.
+6. Publish if the view changed. A failed tick publishes too, with its problem in `health`. A project T3 does not list still gets a view, named by its id alone, so the pane says why it is empty.
 
 The cadence is 1.5 s while a client watches the project and 20 s otherwise. Each consecutive failure doubles it, up to 60 s. Any user command triggers an immediate tick.
 
 A tick that fails halfway leaves correct, partly stale state. Every step is an upsert or a whole-value replace, and the next tick redoes it. Writes are classified by `T3Error::may_have_applied`. A `Send` carries the client's `SendId` as T3's `clientRequestId`, so resending cannot duplicate. A coordinator launch whose response was lost is found by its tag before any relaunch.
+
+Only the user's `c` launches a coordinator. A launch T3 refuses fails that command, and the reply carries T3's reason. The sync stays healthy, and nothing launches again until the user presses `c` again.
 
 ## The coordinator and its jobs
 
@@ -88,26 +92,37 @@ The coordinator key is the single durable fact per project. `Binding { key, mint
 
 `coordinator::jobs` derives roles from the scanned rows on every publish. It is a pure function, and roles are never stored. Rows arrive newest first, so a child is often seen before its parent.
 
-`ensure_step` is the whole lifecycle:
+`ensure_step` is the whole lifecycle. The user's `c` runs every step, and a tick runs only `Lookup`:
 
-| Binding | Looked up since last launch | Step |
-| --- | --- | --- |
-| none | (any) | `Mint`: persist a fresh key |
-| key, no thread | no | `Lookup`: `t3_thread_list { titleContains: seirei:<KEY> }`, adopt the oldest match |
-| key, no thread | yes | `Launch`, then persist the thread id |
-| key, thread | (any) | `Ready` |
+| Binding | Looked up since last launch | Step | Run by |
+| --- | --- | --- | --- |
+| none | (any) | `Mint`: persist a fresh key | `c` |
+| key, no thread | no | `Lookup`: `t3_thread_list { titleContains: seirei:<KEY> }`, adopt the oldest match | a tick or `c` |
+| key, no thread | yes | `Launch`, then persist the thread id | `c` |
+| key, thread | (any) | `Ready` | |
 
-"Looked up" lives in memory, so a restarted daemon always looks before it launches. A crash between `t3_thread_launch` and recording its result resolves on the next tick. The lookup finds the tagged thread and binds it.
+`c` sets "looked up" to no before it starts, so it always looks before it launches. That adopts a launch T3 applied after its response was lost, even when a tick already looked. "Looked up" lives in memory, so a restarted daemon looks once on its first tick. A crash between `t3_thread_launch` and recording its result resolves on the next tick. The lookup finds the tagged thread and binds it.
+
+A key with no thread shows as no coordinator, so `c` stays available and reuses the key. The pane shows the coordinator as starting only while a launch the user asked for is in flight, or after the launch until the scan sees its thread.
 
 The coordinator launches at the credential's ceiling. A coordinator above the ceiling would be read-only to seirei.
+
+`coordinator::launch_model` picks the coordinator's model, first match wins:
+
+1. `coordinator_model` from the config file, written `<providerInstanceId>/<model>`.
+2. The project's default model. Seirei passes no `modelSelection`, and T3 applies the default.
+3. The model of the project's newest thread, the first row of `t3_thread_list`.
+4. The first model `orchestrator_capabilities` offers from a provider without constraints.
+
+With none of these, the launch fails before it reaches T3. A launch re-reads the project, so a default set in T3 after the daemon started applies.
 
 ## The TUI
 
 `App::update(Event) -> Vec<Effect>` is pure. It does no IO and reads no terminal or clock. `Screen` is `Picker` or `Project`. Inside a project, `Focus` (`Conversation`, `Jobs`, `Job(id)`) and `Mode` (`Browse`, `Compose`, `ConfirmCreate`, `Answer`) are separate enums, so modes exclude each other by construction. The keymap context is derived, never stored. The subscription is derived from the screen and resent whenever it changes or the link comes back.
 
-The keymap is one table of `(context, key, action, help)`. Dispatch, the help overlay, and the footer all read it. Tests fail the build when a key is bound twice in one context, or when the composer would swallow a bound printable key. A binding shows in the footer only when its action can do something now. "Message the coordinator" needs a coordinator.
+The keymap is one table of `(context, key, action, help)`. Dispatch, the help overlay, and the footer all read it. Tests fail the build when a key is bound twice in one context, or when the composer would swallow a bound printable key. A binding shows in the footer only when its action can do something now. "Message the coordinator" needs a coordinator, and a login whose grant allows the coordinator's runtime mode. The view carries the grant of the credential `seirei login` saved. A token from `$SEIREI_T3_TOKEN` or the config file has no known grant, so T3 alone decides. When the grant is all that keeps a binding dead, the pane names the `seirei login` that would make it live.
 
-A draft's `SendId` changes only after the daemon confirms the send. Losing the daemon mid-send turns the draft into a resendable failure, and resending cannot duplicate.
+Losing the daemon mid-send turns the draft into a resendable failure. Resending the same text reuses the draft's `SendId`, so it cannot duplicate. Editing the text makes a new message with a fresh `SendId`, because T3 would drop the edit as a duplicate if the lost send had landed. A confirmed send also starts a fresh `SendId`.
 
 ## Synthesis decision
 
