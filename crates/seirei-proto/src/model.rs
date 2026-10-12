@@ -34,10 +34,15 @@ pub enum MachineStatus {
     Failed {
         detail: String,
     },
-    /// The same T3 as `of`, which comes first in `MachineId` order. It lists no projects, so
-    /// each project appears once.
+    /// The same T3 as `of`, which comes first in `MachineId` order, whether or not `of` answers
+    /// now. It lists no projects and takes no commands, so each project has one coordinator.
     Duplicate {
         of: MachineId,
+    },
+    /// Connected, but to another T3 than this address reached before. Seirei forgot the
+    /// coordinators it knew on the old one.
+    Replaced {
+        detail: String,
     },
 }
 
@@ -59,7 +64,7 @@ pub fn find_project(listing: &[MachineProjects], name: &str) -> Result<ProjectRe
         let machine = &listed.machine;
         return match listed.projects.iter().find(|project| named(project, wanted)) {
             Some(project) => Ok(ProjectRef { machine: machine.id.clone(), project: project.id.clone() }),
-            None if machine.status == MachineStatus::Connected => {
+            None if matches!(machine.status, MachineStatus::Connected | MachineStatus::Replaced { .. }) => {
                 Err(format!("{} has no project titled {wanted:?} or with that id", machine.id))
             }
             None => Err(format!("{} lists no projects: {}", machine.id, machine.status_text())),
@@ -80,15 +85,21 @@ pub fn find_project(listing: &[MachineProjects], name: &str) -> Result<ProjectRe
     }
 }
 
+/// The command that pairs seirei with `machine`'s T3.
+pub fn login_command(machine: &MachineId) -> String {
+    if machine.is_local() { "seirei login".into() } else { format!("seirei login {machine}") }
+}
+
 impl Machine {
     /// The status in words, with what would fix it.
     pub fn status_text(&self) -> String {
         match &self.status {
             MachineStatus::Connected => "connected".into(),
-            MachineStatus::NeedsLogin => "needs login: run `seirei login`".into(),
+            MachineStatus::NeedsLogin => format!("needs login: run `{}`", login_command(&self.id)),
             MachineStatus::Unreachable { detail } => format!("unreachable: {detail}"),
             MachineStatus::Failed { detail } => format!("failed: {detail}"),
             MachineStatus::Duplicate { of } => format!("the same T3 as {of}, so its projects are listed there"),
+            MachineStatus::Replaced { detail } => format!("connected, but {detail}"),
         }
     }
 }

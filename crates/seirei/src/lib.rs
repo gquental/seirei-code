@@ -30,12 +30,13 @@ pub async fn run_daemon(config: Config) -> anyhow::Result<Started> {
     let listener = tokio::net::UnixListener::bind(&socket)?;
     let machines = config.machines.into_iter().map(|machine| {
         if machine.token.is_none() {
-            eprintln!("seirei: no usable credential for {}; run `seirei login`", machine.id);
+            let login = seirei_proto::model::login_command(&machine.id);
+            eprintln!("seirei: no usable credential for {}; run `{login}`", machine.id);
         }
-        let api = t3::McpT3::new(machine.t3_home, machine.token);
+        let api = t3::McpT3::new(machine.endpoint, machine.token);
         (machine.id, server::MachineApi::new(api, machine.coordinator_model))
     });
-    let daemon = server::Daemon::new(machines, config.state_dir);
+    let daemon = server::Daemon::new(machines, config.state_dir)?;
     daemon.warm_start()?;
     daemon.serve(listener).await?;
     let _ = std::fs::remove_file(&socket);

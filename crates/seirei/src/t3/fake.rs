@@ -1,4 +1,4 @@
-use super::{Launch, PageSize, Position, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage};
+use super::{Environment, Launch, PageSize, Position, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage};
 use seirei_proto::{
     ids::{ItemId, ModelId, ProjectId, ProviderInstanceId, RequestId, SendId, T3Time, ThreadId},
     model::{
@@ -10,7 +10,10 @@ use seirei_proto::{
 use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::sync::watch;
 
@@ -24,6 +27,8 @@ pub struct State {
     pub project: Project,
     pub access: Option<Access>,
     pub down: Option<Down>,
+    /// Unique per fake unless a test makes two share one, as two addresses for one T3 would.
+    pub environment: Environment,
     pub models: Vec<ModelSelection>,
     pub threads: Vec<ThreadSummary>,
     pub items: HashMap<ThreadId, Vec<Item>>,
@@ -43,10 +48,13 @@ pub struct State {
 
 impl FakeT3 {
     pub fn new(project: Project) -> Self {
+        static ENVIRONMENTS: AtomicUsize = AtomicUsize::new(0);
+        let n = ENVIRONMENTS.fetch_add(1, Ordering::Relaxed);
         let state = State {
             project,
             access: None,
             down: None,
+            environment: Environment { environment_id: format!("environment-{n}"), label: format!("fake-{n}") },
             models: vec![opus()],
             threads: Vec::new(),
             items: HashMap::new(),
@@ -68,9 +76,18 @@ impl FakeT3 {
     pub fn with<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
         change(&mut self.state.lock().expect("no test panics while holding the fake"))
     }
+
+    async fn answering(&self) -> Result<(), T3Error> {
+        match self.with(|state| state.down) {
+            None => Ok(()),
+            Some(Down::Refused) => Err(T3Error::NoSession(Box::new(T3Error::Unreachable("connection refused".into())))),
+            Some(Down::LoggedOut) => Err(T3Error::NoSession(Box::new(T3Error::Unauthorized))),
+            Some(Down::Silent) => std::future::pending().await,
+        }
+    }
 }
 
-/// Why `projects` fails.
+/// Why `environment` and `projects` fail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Down {
     Refused,
@@ -162,13 +179,14 @@ impl T3Api for FakeT3 {
         "http://fake.test".into()
     }
 
+    async fn environment(&self) -> Result<Environment, T3Error> {
+        self.answering().await?;
+        Ok(self.with(|state| state.environment.clone()))
+    }
+
     async fn projects(&self) -> Result<Vec<Project>, T3Error> {
-        match self.with(|state| state.down) {
-            None => Ok(self.with(|state| vec![state.project.clone()])),
-            Some(Down::Refused) => Err(T3Error::NoSession(Box::new(T3Error::Unreachable("connection refused".into())))),
-            Some(Down::LoggedOut) => Err(T3Error::NoSession(Box::new(T3Error::Unauthorized))),
-            Some(Down::Silent) => std::future::pending().await,
-        }
+        self.answering().await?;
+        Ok(self.with(|state| vec![state.project.clone()]))
     }
 
     async fn models(&self) -> Result<Vec<ModelSelection>, T3Error> {
