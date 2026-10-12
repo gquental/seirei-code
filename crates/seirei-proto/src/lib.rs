@@ -1,3 +1,4 @@
+pub mod home;
 pub mod ids;
 pub mod model;
 pub mod timeline;

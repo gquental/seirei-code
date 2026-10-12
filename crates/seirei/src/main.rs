@@ -5,6 +5,7 @@ use clap::{
 };
 use seirei::{Started, config::Config};
 use seirei_proto::{
+    home,
     ids::MachineId,
     model::{self, Access, CoordinatorView, MachineProjects, MachineStatus, PAIRING_HINT, ProjectView},
     timeline::Timeline,
@@ -110,7 +111,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Machine { command: MachineCmd::Remove { name } }) => runtime.block_on(remove_machine(name)),
         Some(Cmd::Status { project }) => runtime.block_on(status(project)),
         None => runtime.block_on(seirei_tui::run(seirei_tui::Launch {
-            socket: wire::socket_path(),
+            socket: home::socket()?,
             open: cli.project,
             spawn_daemon,
         })),
@@ -121,7 +122,7 @@ fn main() -> anyhow::Result<()> {
 /// the terminal does not take it down.
 fn spawn_daemon() -> io::Result<()> {
     let state_dir = Config::load().map_err(io::Error::other)?.state_dir;
-    std::fs::create_dir_all(&state_dir)?;
+    seirei::create_private_dir(&state_dir)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(state_dir.join("daemon.log"))?;
     (std::process::Command::new(std::env::current_exe()?))
         .arg("daemon")
@@ -301,7 +302,7 @@ struct Client {
 
 impl Client {
     async fn connect() -> io::Result<Option<Self>> {
-        match UnixStream::connect(wire::socket_path()).await {
+        match UnixStream::connect(home::socket()?).await {
             Ok(stream) => {
                 let (read, write) = stream.into_split();
                 Ok(Some(Self { lines: BufReader::new(read).lines(), write, calls: 0 }))
@@ -322,7 +323,7 @@ impl Client {
                 return Ok(client);
             }
         }
-        bail!("started a daemon, but it is not listening at {}", wire::socket_path().display())
+        bail!("started a daemon, but it is not listening at {}", home::socket()?.display())
     }
 
     /// A session with a daemon of this build, started when none runs.

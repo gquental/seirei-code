@@ -102,7 +102,9 @@ In the answer form, `j` and `k` move between options, `Space` toggles one, `Ente
 
 ## Configuration
 
-Seirei reads `$XDG_CONFIG_HOME/seirei/config.toml`, usually `~/.config/seirei/config.toml`. Every key is optional, and the file may be absent.
+Seirei keeps its files in `~/.seirei/code` on every platform. Set `$SEIREI_HOME` to an absolute path to use another folder. The files you may edit sit at the top of that folder. Seirei keeps its own state in `state/`, and the daemon logs to `state/daemon.log`. The daemon's socket is `daemon.sock`, unless `$SEIREI_SOCKET` names another path.
+
+Seirei reads its settings from `config.toml`. Every key is optional, and the file may be absent.
 
 | Key | What it does |
 | --- | --- |

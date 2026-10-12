@@ -16,7 +16,9 @@ const MACHINES_HEADER: &str = "# The T3 servers seirei reaches besides this mach
                                # Seirei rewrites this file when you add or remove a machine.\n\n";
 
 pub struct Config {
+    /// The root, holding what a user may edit: `config.toml`, `machines.toml`, and `credentials/`.
     pub dir: PathBuf,
+    /// `state/` in the root, which only seirei writes.
     pub state_dir: PathBuf,
     /// `local` first, then by name.
     pub machines: Vec<MachineConfig>,
@@ -132,15 +134,17 @@ type MachinesFile = BTreeMap<MachineId, MachineEntry>;
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let dirs = directories::ProjectDirs::from("", "", "seirei").context("no home directory")?;
-        let dir = dirs.config_dir().to_path_buf();
+        Self::load_from(seirei_proto::home::root()?)
+    }
+
+    fn load_from(dir: PathBuf) -> anyhow::Result<Self> {
         let path = dir.join("config.toml");
         let file: File = read_toml(&path)?;
         let coordinator_model = (file.coordinator_model.as_deref().map(model_selection).transpose())
             .with_context(|| format!("parsing {}", path.display()))?;
-        let home = directories::BaseDirs::new().context("no home directory")?.home_dir().to_path_buf();
+        let home = std::env::home_dir().context("no home directory")?;
         let t3_home = (env("T3CODE_HOME").map(PathBuf::from)).or(file.t3_home).unwrap_or_else(|| home.join(".t3"));
-        let state_dir = dirs.state_dir().unwrap_or_else(|| dirs.data_local_dir()).to_path_buf();
+        let state_dir = dir.join("state");
         let endpoint = Endpoint::Local { t3_home };
         let token = match env("SEIREI_T3_TOKEN").or(file.t3_token) {
             Some(token) => Some(Token { secret: Secret(token), access: None }),
@@ -296,6 +300,27 @@ mod tests {
         assert_eq!((token.secret, token.access), (Secret("t3-secret".into()), Some(Access::Auto)));
         save(&path, "http://127.0.0.1:3773", SystemTime::now() - Duration::from_secs(1));
         assert!(saved_token(&path, &local).expect("readable").is_none(), "a lapsed credential is not used");
+    }
+
+    #[test]
+    fn config_is_read_from_the_root_and_state_kept_under_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join(".seirei/code");
+        let studio = MachineId::parse("studio").unwrap();
+        let at = TailnetOrigin::parse("https://mac-studio.tail123b88.ts.net").unwrap();
+        add_machine(&root, &studio, &at).expect("added");
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the root seirei creates is private");
+        save(&credentials(&root, &studio), at.as_str(), SystemTime::now() + Duration::from_secs(3600));
+        std::fs::write(root.join("config.toml"), "coordinator_model = \"claudeAgent/claude-opus-5-5\"\n").unwrap();
+
+        let config = Config::load_from(root.clone()).expect("loads");
+        assert_eq!((&config.dir, &config.state_dir), (&root, &root.join("state")));
+        let [local, remote] = &config.machines[..] else { panic!("local and studio") };
+        let model = local.coordinator_model.as_ref().map(|model| model.model.as_str());
+        assert_eq!(model, Some("claude-opus-5-5"), "config.toml is read from the root");
+        assert!(remote.id == studio && remote.token.is_some(), "so are machines.toml and the credential");
     }
 
     #[test]

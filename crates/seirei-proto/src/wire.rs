@@ -11,10 +11,7 @@ use crate::{
     timeline::Timeline,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{
-    path::PathBuf,
-    sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock};
 
 pub const MAX_LINE: usize = 16 << 20;
 
@@ -150,24 +147,6 @@ pub fn encode(msg: &impl Serialize) -> Vec<u8> {
 
 pub fn decode<T: DeserializeOwned>(line: &[u8]) -> serde_json::Result<T> {
     serde_json::from_slice(line)
-}
-
-pub fn socket_path() -> PathBuf {
-    let var = |name| std::env::var_os(name).filter(|value| !value.is_empty());
-    if let Some(path) = var("SEIREI_SOCKET") {
-        return path.into();
-    }
-    if let Some(dir) = var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("seirei/daemon.sock");
-    }
-    std::env::temp_dir().join(format!("seirei-{}", user_id())).join("daemon.sock")
-}
-
-fn user_id() -> String {
-    use std::os::unix::fs::MetadataExt;
-    (std::env::var("UID").ok().filter(|uid| !uid.is_empty()))
-        .or_else(|| std::env::home_dir().and_then(|home| home.metadata().ok()).map(|m| m.uid().to_string()))
-        .unwrap_or_else(|| "user".into())
 }
 
 #[cfg(test)]

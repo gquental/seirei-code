@@ -18,14 +18,14 @@ pub enum Started {
 }
 
 pub async fn run_daemon(config: Config) -> anyhow::Result<Started> {
-    std::fs::create_dir_all(&config.state_dir)?;
+    let socket = seirei_proto::home::socket()?;
+    create_private_dir(&config.state_dir)?;
     let lock = std::fs::File::create(config.state_dir.join("daemon.lock"))?;
     if lock.try_lock().is_err() {
         return Ok(Started::AlreadyRunning);
     }
-    let socket = seirei_proto::wire::socket_path();
     if let Some(dir) = socket.parent() {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        create_private_dir(dir)?;
     }
     let _ = std::fs::remove_file(&socket);
     let listener = tokio::net::UnixListener::bind(&socket)?;
@@ -44,9 +44,14 @@ pub async fn run_daemon(config: Config) -> anyhow::Result<Started> {
     Ok(Started::Served)
 }
 
+/// Creates `dir` and any missing parent readable by this user alone.
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+}
+
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
     }
     let temp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&temp);

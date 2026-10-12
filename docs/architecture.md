@@ -36,7 +36,7 @@ Seirei talks to T3's MCP server over streamable HTTP. The local origin comes fro
 
 | Crate | Owns | Why it is its own crate |
 | --- | --- | --- |
-| `seirei-proto` | Domain types, the timeline window, socket frames, the socket path | The only code both sides share. No tokio, no reqwest, no ratatui. |
+| `seirei-proto` | Domain types, the timeline window, socket frames, where seirei keeps its files | The only code both sides share. No tokio, no reqwest, no ratatui. |
 | `seirei-tui` | The app state machine, keymap, render, terminal and socket runtime | `seirei` depends on it, so it cannot depend on `seirei`. T3's wire format is unreachable from terminal code. |
 | `seirei` | The daemon (T3 boundary, project actors, server), `login`, and the CLI | The daemon has one consumer, the binary. A separate crate would hide nothing. |
 
@@ -46,6 +46,7 @@ Module map:
 - `seirei_proto::model` holds machines and their status, projects, thread summaries, model selections, runtime modes and the credential's `Access`, lineage, jobs, the coordinator view, questions, and health.
 - `seirei_proto::timeline` holds timeline items, the open-set `ItemKind`, and the window.
 - `seirei_proto::wire` holds the socket protocol.
+- `seirei_proto::home` finds the root that holds every seirei file, and the socket path.
 - `seirei::config` decides which machines exist and where their configuration and credentials come from.
 - `seirei::t3` is the `T3Api` seam, page sizes, positions, and the error taxonomy. `t3::mcp` speaks MCP over HTTP. `t3::wire` turns T3's JSON into domain types. `t3::login` runs the pairing flow.
 - `seirei::coordinator` decides attribution, the coordinator key and tags, the coordinator's model, the brief, and the ensure state machine.
@@ -59,17 +60,36 @@ Each watched project has one actor task, the only writer of that project's state
 
 Actors publish through `watch` channels. Each project has one `Arc<ProjectView>`, and each open timeline has one `Arc<Timeline>`. A slow reader skips to the latest value. Interest is channel liveness. A timeline stays hot exactly as long as some session holds its receiver, and the view's receiver count picks the polling cadence.
 
-The durable state is the coordinator binding in `<state_dir>/machines/<machine>/projects/<project>.json` and each machine's T3 identity in `<state_dir>/machines/<machine>/identity.json`. Everything else is rebuilt from T3 after a restart.
+The durable state is the coordinator binding in `<root>/state/machines/<machine>/projects/<project>.json` and each machine's T3 identity in `<root>/state/machines/<machine>/identity.json`. Everything else is rebuilt from T3 after a restart.
+
+## Files
+
+Every file seirei keeps is under one root, the same on every platform. The root is `$SEIREI_HOME` when it is set, else `~/.seirei/code`. `$SEIREI_HOME` and `$SEIREI_SOCKET` must be absolute paths, so commands started in different folders reach the same daemon. `seirei_proto::home` alone decides it, so the daemon and its clients agree. `Config::load` derives the other paths from it. Seirei creates the root readable by its user alone.
+
+The top of the root holds what a user may read and edit. `state/` holds what only seirei writes.
+
+| Path | Holds |
+| --- | --- |
+| `config.toml` | Settings for seirei and the local machine |
+| `machines.toml` | The other machines |
+| `credentials/<machine>.json` | Each machine's saved login |
+| `state/machines/<machine>/identity.json` | The machine's T3 identity |
+| `state/machines/<machine>/projects/<project>.json` | A project's coordinator binding |
+| `state/daemon.lock` | The lock the running daemon holds |
+| `state/daemon.log` | The background daemon's output |
+| `daemon.sock` | The socket, unless `$SEIREI_SOCKET` names another path |
+
+A Unix socket path may be at most 103 bytes on macOS and 107 on Linux. When the socket path is longer, every command that reaches the daemon fails and names the path. Set `$SEIREI_SOCKET`, or a shorter `$SEIREI_HOME`.
 
 ## Machines
 
 A machine is one T3 server. `local` is the T3 on this machine, found through `server-runtime.json`. T3 ids are unique only within one T3, so the daemon keys every project by `ProjectRef`, its machine and its T3 id. Thread ids stay plain, because every thread reference travels inside a project's scope.
 
-Each machine has its own `T3Api`, credential, and state folder. Nothing is shared between machines. A login's credential is saved to `<config_dir>/credentials/<machine>.json`. A token from `$SEIREI_T3_TOKEN` or `t3_token` applies to `local` only.
+Each machine has its own `T3Api`, credential, and state folder. Nothing is shared between machines. A login's credential is saved to `<root>/credentials/<machine>.json`. A token from `$SEIREI_T3_TOKEN` or `t3_token` applies to `local` only.
 
 `ListProjects` asks every machine at once and waits at most 5 s for each. A machine that fails lists no projects and reports why: `NeedsLogin` for a missing, lapsed, or rejected credential, `Unreachable` when T3 does not answer, and `Failed` when it answers with something other than its projects. One machine never fails the whole call. A call goes out even without a credential, so a T3 that is down reads as unreachable rather than as a missing login.
 
-Other machines live in `<config_dir>/machines.toml`, one table per machine with its `address` and an optional `coordinator_model`. `local` is implicit and cannot be added or removed. Its `coordinator_model` stays in `config.toml`. A user may edit the file by hand, and the daemon reads such an edit when it starts.
+Other machines live in `<root>/machines.toml`, one table per machine with its `address` and an optional `coordinator_model`. `local` is implicit and cannot be added or removed. Its `coordinator_model` stays in `config.toml`. A user may edit the file by hand, and the daemon reads such an edit when it starts.
 
 The daemon owns machine changes. `AddMachine`, `RemoveMachine`, and `Login` are socket commands. `seirei machine add`, `seirei machine remove`, and `seirei login` are clients that send them, and they start the daemon when none runs. The TUI's picker sends them too. So while the daemon runs, it is the only writer of `machines.toml` and the credential files. A change takes one lock over the machine registry, writes the file, and updates the registry before it lets go. Two changes at once cannot lose each other's writes.
 
@@ -87,7 +107,7 @@ A bare project title that more than one machine lists is ambiguous. `seirei` and
 
 ## The protocol
 
-- **Framing.** One JSON object per line over a Unix socket at `$SEIREI_SOCKET`, else `$XDG_RUNTIME_DIR/seirei/daemon.sock`. You can debug it with `socat`.
+- **Framing.** One JSON object per line over a Unix socket at `$SEIREI_SOCKET`, else `<root>/daemon.sock`. You can debug it with `socat`.
 - **Versioning.** The TUI and daemon are one executable, so the protocol needs build detection, not compatibility rules. `Hello`, `Welcome`, `WrongBuild`, and `Yielding` are frozen. Every other shape may change in any build. A TUI that finds an older daemon offers to restart it.
 - **What crosses.** Whole domain values. `Project(ProjectView)` carries the pane, and `Timeline` carries one thread's window. Nothing is a delta, a sequence number, or a view model.
 - **Convergence.** `Subscribe { project, job }` is declarative and replaces the last one. `project` is a `ProjectRef`, and every `Project` frame names its machine. A reconnecting client sends `Hello` and its current subscription, and its first frames are the full current values.
@@ -184,4 +204,4 @@ Rejected: A's patch protocol and B's replica machinery (sequence numbers, epochs
 
 - Should attribution also read the coordinator's `t3_thread_launch` tool calls? T3 includes the tool output in `dynamic_tool` items, so a job the coordinator forgot to tag could still be found. The output's exact JSON needs a real coordinator transcript first.
 - What ceiling should `seirei login` request by default? It requests `full-access` because a coordinator usually runs without approval prompts.
-- Should the coordinator brief be user-editable, for example a file in the config directory?
+- Should the coordinator brief be user-editable, for example a file in the root?
