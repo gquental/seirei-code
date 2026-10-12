@@ -1,5 +1,9 @@
-use super::{Environment, Launch, PageSize, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage, wire};
-use crate::config::{Endpoint, Token};
+use super::{
+    Environment, Launch, PageSize, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage,
+    login::{self, Credentials, LoginError, PairingCode},
+    wire,
+};
+use crate::config::{Endpoint, Secret, Token};
 use seirei_proto::{
     ids::{ProjectId, RequestId, SendId, ThreadId},
     model::{Access, Answers, ModelSelection, PendingRequest, Project, ThreadSummary},
@@ -8,7 +12,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -21,15 +28,18 @@ pub struct McpT3 {
     /// A 401 is reported as `Unauthorized`, never retried: only `seirei login` mints a token,
     /// because a CLI-issued session is capped at `approval-required`. Without a token, calls still
     /// go out, so a T3 that is down reads as unreachable rather than as a missing login.
-    token: Option<Token>,
+    token: Mutex<Option<Token>>,
     session: tokio::sync::Mutex<Option<Session>>,
     next_id: AtomicU64,
 }
 
+/// A session serves only the credential that opened it, so a new login never rides on a
+/// session T3 authorized for the old one.
 #[derive(Clone, PartialEq)]
 struct Session {
     endpoint: String,
     id: String,
+    bearer: Option<Secret>,
 }
 
 enum Posted {
@@ -52,15 +62,6 @@ pub fn origin(t3_home: &Path) -> Result<String, T3Error> {
 }
 
 impl McpT3 {
-    pub fn new(endpoint: Endpoint, token: Option<Token>) -> Self {
-        let http = (reqwest::Client::builder())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("a client with the built-in TLS and no proxies always builds");
-        Self { http, endpoint, token, session: Default::default(), next_id: AtomicU64::new(1) }
-    }
-
     /// Null arguments are dropped: T3's validators reject an explicit `null` for an optional
     /// parameter even where the published schema allows it.
     async fn call(&self, tool: &'static str, mut args: Value) -> Result<Value, T3Error> {
@@ -69,10 +70,10 @@ impl McpT3 {
         }
         let request = self.rpc("tools/call", json!({ "name": tool, "arguments": args }));
         let (session, reused) = self.session(None).await?;
-        let posted = match self.post(&session.endpoint, Some(&session.id), &request).await {
+        let posted = match self.post(&session.endpoint, session.bearer.as_ref(), Some(&session.id), &request).await {
             Ok(Posted::SessionGone) | Err(T3Error::Unreachable(_)) if reused => {
                 let (session, _) = self.session(Some(&session)).await?;
-                self.post(&session.endpoint, Some(&session.id), &request).await?
+                self.post(&session.endpoint, session.bearer.as_ref(), Some(&session.id), &request).await?
             }
             posted => posted?,
         };
@@ -83,26 +84,28 @@ impl McpT3 {
         }
     }
 
-    /// The cached session unless it is `stale`, else a new one, and whether it was cached. The
-    /// lock is held across the connect, so concurrent callers share one rebuild.
+    /// The cached session unless it is `stale` or opened with another credential, else a new
+    /// one, and whether it was cached. The lock is held across the connect, so concurrent
+    /// callers share one rebuild.
     async fn session(&self, stale: Option<&Session>) -> Result<(Session, bool), T3Error> {
+        let bearer = self.token.lock().expect("no panics while held").as_ref().map(|token| token.secret.clone());
         let mut cached = self.session.lock().await;
-        if let Some(session) = cached.as_ref().filter(|&session| Some(session) != stale) {
+        if let Some(session) = cached.as_ref().filter(|&session| Some(session) != stale && session.bearer == bearer) {
             return Ok((session.clone(), true));
         }
-        let session = self.connect().await.map_err(|cause| T3Error::NoSession(Box::new(cause)))?;
+        let session = self.open(bearer).await.map_err(|cause| T3Error::NoSession(Box::new(cause)))?;
         *cached = Some(session.clone());
         Ok((session, false))
     }
 
-    async fn connect(&self) -> Result<Session, T3Error> {
+    async fn open(&self, bearer: Option<Secret>) -> Result<Session, T3Error> {
         let endpoint = format!("{}/mcp", self.endpoint.origin()?);
         let hello = json!({
             "protocolVersion": PROTOCOL,
             "capabilities": {},
             "clientInfo": { "name": "seirei", "version": env!("CARGO_PKG_VERSION") },
         });
-        let id = match self.post(&endpoint, None, &self.rpc("initialize", hello)).await? {
+        let id = match self.post(&endpoint, bearer.as_ref(), None, &self.rpc("initialize", hello)).await? {
             Posted::Answer { session: Some(id), body } if body.get("result").is_some() => id,
             Posted::Answer { body, .. } => {
                 return Err(T3Error::Malformed(format!("initialize opened no session: {body}")));
@@ -112,8 +115,8 @@ impl McpT3 {
             }
         };
         let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        self.post(&endpoint, Some(&id), &initialized).await?;
-        Ok(Session { endpoint, id })
+        self.post(&endpoint, bearer.as_ref(), Some(&id), &initialized).await?;
+        Ok(Session { endpoint, id, bearer })
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {
@@ -121,12 +124,18 @@ impl McpT3 {
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
     }
 
-    async fn post(&self, endpoint: &str, session: Option<&str>, body: &Value) -> Result<Posted, T3Error> {
+    async fn post(
+        &self,
+        endpoint: &str,
+        bearer: Option<&Secret>,
+        session: Option<&str>,
+        body: &Value,
+    ) -> Result<Posted, T3Error> {
         let mut request = (self.http.post(endpoint))
             .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
             .json(body);
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(&token.secret.0);
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(&bearer.0);
         }
         if let Some(id) = session {
             request = request.header(SESSION_HEADER, id).header("mcp-protocol-version", PROTOCOL);
@@ -185,8 +194,27 @@ fn tool_result(mut body: Value) -> Result<Value, T3Error> {
 }
 
 impl T3Api for McpT3 {
+    fn connect(endpoint: Endpoint, token: Option<Token>) -> Self {
+        let http = (reqwest::Client::builder())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("a client with the built-in TLS and no proxies always builds");
+        Self { http, endpoint, token: Mutex::new(token), session: Default::default(), next_id: AtomicU64::new(1) }
+    }
+
     fn access(&self) -> Option<Access> {
-        self.token.as_ref().and_then(|token| token.access)
+        self.token.lock().expect("no panics while held").as_ref().and_then(|token| token.access)
+    }
+
+    async fn pair(&self, access: Access, code: PairingCode) -> Result<Credentials, LoginError> {
+        let origin = (self.endpoint.origin())
+            .map_err(|e| LoginError::Unreachable { origin: self.endpoint.address(), detail: e.to_string() })?;
+        login::login(&origin, access, code).await
+    }
+
+    fn use_token(&self, token: Token) {
+        *self.token.lock().expect("no panics while held") = Some(token);
     }
 
     fn address(&self) -> String {
@@ -300,7 +328,7 @@ impl T3Api for McpT3 {
 mod tests {
     use super::*;
     use crate::{config::Secret, t3::Position};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -308,10 +336,18 @@ mod tests {
 
     type Respond = fn(&str) -> (u16, Option<&'static str>, String);
 
+    type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
     struct Stub {
         t3: McpT3,
-        methods: Arc<Mutex<Vec<String>>>,
+        seen: Seen,
         t3_home: tempfile::TempDir,
+    }
+
+    impl Stub {
+        fn methods(&self) -> Vec<String> {
+            self.seen.lock().unwrap().iter().map(|(method, _)| method.clone()).collect()
+        }
     }
 
     async fn stub(respond: Respond) -> Stub {
@@ -320,32 +356,39 @@ mod tests {
         std::fs::create_dir_all(t3_home.path().join("userdata")).unwrap();
         let runtime = json!({ "origin": format!("http://{}", listener.local_addr().unwrap()) });
         std::fs::write(t3_home.path().join("userdata/server-runtime.json"), runtime.to_string()).unwrap();
-        let methods = Arc::new(Mutex::new(Vec::new()));
-        let seen = methods.clone();
+        let seen = Seen::default();
+        let recorder = seen.clone();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-                tokio::spawn(exchange(stream, respond, seen.clone()));
+                tokio::spawn(exchange(stream, respond, recorder.clone()));
             }
         });
         let token = Token { secret: Secret("stub".into()), access: None };
         let endpoint = Endpoint::Local { t3_home: t3_home.path().to_path_buf() };
-        Stub { t3: McpT3::new(endpoint, Some(token)), methods, t3_home }
+        Stub { t3: McpT3::connect(endpoint, Some(token)), seen, t3_home }
     }
 
-    async fn exchange(mut stream: TcpStream, respond: Respond, seen: Arc<Mutex<Vec<String>>>) {
+    async fn exchange(mut stream: TcpStream, respond: Respond, seen: Seen) {
         let mut buf = Vec::new();
         let mut chunk = [0; 4096];
-        let (head_len, body_len) = loop {
+        let (head_len, body_len, bearer) = loop {
             let n = stream.read(&mut chunk).await.unwrap();
             if n == 0 {
                 return;
             }
             buf.extend_from_slice(&chunk[..n]);
             if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
-                let length = head.lines().find_map(|line| line.strip_prefix("content-length:"));
-                break (end + 4, length.map_or(0, |n| n.trim().parse().unwrap()));
+                let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                let header = |name: &str| {
+                    head.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
+                    })
+                };
+                let length = header("content-length").map_or(0, |n| n.parse().unwrap());
+                let bearer = header("authorization").and_then(|auth| auth.strip_prefix("Bearer ").map(String::from));
+                break (end + 4, length, bearer);
             }
         };
         while buf.len() < head_len + body_len {
@@ -354,7 +397,7 @@ mod tests {
         }
         let request: Value = serde_json::from_slice(&buf[head_len..head_len + body_len]).unwrap();
         let method = request["method"].as_str().unwrap_or_default().to_owned();
-        seen.lock().unwrap().push(method.clone());
+        seen.lock().unwrap().push((method.clone(), bearer));
         let (status, session, body) = respond(&method);
         let session = session.map_or_else(String::new, |id| format!("{SESSION_HEADER}: {id}\r\n"));
         let response = format!(
@@ -373,19 +416,19 @@ mod tests {
         assert!(!matches!(failed, T3Error::Unreachable(_)), "T3 answered, so it is reachable: {failed:?}");
         assert!(failed.to_string().contains("cannot parse"), "the error says what happened: {failed}");
         assert!(!failed.may_have_applied(), "the answer never left, so a retry is safe: {failed}");
-        assert_eq!(*stub.methods.lock().unwrap(), ["initialize"]);
+        assert_eq!(stub.methods(), ["initialize"]);
     }
 
     #[tokio::test]
     async fn without_a_token_a_running_t3_needs_a_login_and_a_stopped_one_is_unreachable() {
         let stub = stub(|_| (401, None, r#"{"error":"invalid_mcp_credential"}"#.into())).await;
-        let anonymous = McpT3::new(Endpoint::Local { t3_home: stub.t3_home.path().to_path_buf() }, None);
+        let anonymous = McpT3::connect(Endpoint::Local { t3_home: stub.t3_home.path().to_path_buf() }, None);
         let refused = anonymous.projects().await.expect_err("T3 wants a credential");
         assert!(
             matches!(refused, T3Error::NoSession(ref cause) if matches!(**cause, T3Error::Unauthorized)),
             "{refused:?}"
         );
-        assert_eq!(*stub.methods.lock().unwrap(), ["initialize"], "the call went out without a token");
+        assert_eq!(stub.methods(), ["initialize"], "the call went out without a token");
 
         let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
         let runtime = json!({ "origin": format!("http://{closed}") });
@@ -423,24 +466,50 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_calls_share_one_session() {
-        let stub = stub(|method| match method {
-            "initialize" => (200, Some("session-1"), json!({ "jsonrpc": "2.0", "id": 1, "result": {} }).to_string()),
-            "notifications/initialized" => (202, None, String::new()),
-            _ => {
-                let result = json!({ "structuredContent": { "requestIds": [] }, "isError": false });
-                (200, None, json!({ "jsonrpc": "2.0", "id": 2, "result": result }).to_string())
-            }
-        })
-        .await;
+        let stub = stub(answering).await;
         let thread = ThreadId::new("t");
         let pending = || stub.t3.pending(&thread);
         let answers = tokio::join!(pending(), pending(), pending(), pending());
         for answer in [answers.0, answers.1, answers.2, answers.3] {
             assert!(answer.expect("the call succeeds").is_empty());
         }
-        let methods = stub.methods.lock().unwrap().clone();
+        let methods = stub.methods();
         assert_eq!(methods.iter().filter(|m| *m == "initialize").count(), 1, "one caller opened it: {methods:?}");
         assert_eq!(methods.iter().filter(|m| *m == "tools/call").count(), 4);
+    }
+
+    fn answering(method: &str) -> (u16, Option<&'static str>, String) {
+        match method {
+            "initialize" => (200, Some("session-1"), json!({ "jsonrpc": "2.0", "id": 1, "result": {} }).to_string()),
+            "notifications/initialized" => (202, None, String::new()),
+            _ => {
+                let result = json!({ "structuredContent": { "requestIds": [] }, "isError": false });
+                (200, None, json!({ "jsonrpc": "2.0", "id": 2, "result": result }).to_string())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_token_rides_the_next_call_on_a_session_opened_with_it() {
+        let stub = stub(answering).await;
+        let thread = ThreadId::new("t");
+        stub.t3.pending(&thread).await.expect("the first call");
+        stub.t3.use_token(Token { secret: Secret("paired".into()), access: Some(Access::Auto) });
+        assert_eq!(stub.t3.access(), Some(Access::Auto), "the grant changes with the token");
+        stub.t3.pending(&thread).await.expect("the call after the login");
+        let seen = stub.seen.lock().unwrap().clone();
+        let seen: Vec<(&str, Option<&str>)> = seen.iter().map(|(m, bearer)| (m.as_str(), bearer.as_deref())).collect();
+        assert_eq!(
+            seen,
+            [
+                ("initialize", Some("stub")),
+                ("notifications/initialized", Some("stub")),
+                ("tools/call", Some("stub")),
+                ("initialize", Some("paired")),
+                ("notifications/initialized", Some("paired")),
+                ("tools/call", Some("paired")),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -448,7 +517,7 @@ mod tests {
     async fn live_scan_and_tail_read_parse() {
         let config = crate::config::Config::load().expect("the config loads");
         let local = config.machine(&seirei_proto::ids::MachineId::local()).expect("local is always configured");
-        let t3 = McpT3::new(local.endpoint.clone(), local.token.clone());
+        let t3 = McpT3::connect(local.endpoint.clone(), local.token.clone());
         let mut busiest: Option<ThreadSummary> = None;
         for project in t3.projects().await.expect("projects list") {
             let (mut rows, mut unparsed, mut pages, mut cursor) = (0, Vec::new(), 0, None);

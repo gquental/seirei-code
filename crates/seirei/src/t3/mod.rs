@@ -6,6 +6,8 @@ mod wire;
 
 pub use mcp::{McpT3, origin};
 
+use crate::config::{Endpoint, Token};
+use login::{Credentials, LoginError, PairingCode};
 use seirei_proto::{
     ids::{ItemId, ProjectId, RequestId, SendId, ThreadId},
     model::{Access, Answers, ModelSelection, PendingRequest, Project, ThreadSummary},
@@ -14,7 +16,18 @@ use seirei_proto::{
 use std::{collections::BTreeMap, future::Future};
 
 pub trait T3Api: Send + Sync + 'static {
+    /// Reaches the T3 at `endpoint`. Nothing goes out before the first call.
+    fn connect(endpoint: Endpoint, token: Option<Token>) -> Self
+    where
+        Self: Sized;
+
     fn access(&self) -> Option<Access>;
+
+    /// Pairs with this T3 through its pairing-code OAuth flow. The credential comes back unused.
+    fn pair(&self, access: Access, code: PairingCode) -> impl Future<Output = Result<Credentials, LoginError>> + Send;
+
+    /// Every later call carries `token`. A call already in flight finishes with the old one.
+    fn use_token(&self, token: Token);
 
     /// Where this T3 is reached, for display.
     fn address(&self) -> String;

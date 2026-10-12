@@ -50,12 +50,12 @@ Module map:
 - `seirei::t3` is the `T3Api` seam, page sizes, positions, and the error taxonomy. `t3::mcp` speaks MCP over HTTP. `t3::wire` turns T3's JSON into domain types. `t3::login` runs the pairing flow.
 - `seirei::coordinator` decides attribution, the coordinator key and tags, the coordinator's model, the brief, and the ensure state machine.
 - `seirei::project` is one actor per project. It owns the scan, timeline refresh, commands, and publishing.
-- `seirei::server` owns the machines, sessions, the handshake, routing, and the actor registry.
+- `seirei::server` owns the machine registry and every change to it, sessions, the handshake, routing, and the actor registry.
 - `seirei_tui::app` is the TUI state machine, `keymap` every binding, and `render` the drawing.
 
 ## The daemon's state
 
-Each watched project has one actor task, the only writer of that project's state and durable record. Sync ticks and user commands for a project run on that task. So "ensure coordinator" cannot race the scan that would adopt the coordinator it is creating. There is no lock around project state. The only shared structure is the registry that maps a `ProjectRef` to its actor, guarded for get-or-spawn.
+Each watched project has one actor task, the only writer of that project's state and durable record. Sync ticks and user commands for a project run on that task. So "ensure coordinator" cannot race the scan that would adopt the coordinator it is creating. There is no lock around project state. Two structures are shared. The machine registry is guarded so that its changes and the files behind them happen together. The registry that maps a `ProjectRef` to its actor is guarded for get-or-spawn.
 
 Actors publish through `watch` channels. Each project has one `Arc<ProjectView>`, and each open timeline has one `Arc<Timeline>`. A slow reader skips to the latest value. Interest is channel liveness. A timeline stays hot exactly as long as some session holds its receiver, and the view's receiver count picks the polling cadence.
 
@@ -65,15 +65,19 @@ The durable state is the coordinator binding in `<state_dir>/machines/<machine>/
 
 A machine is one T3 server. `local` is the T3 on this machine, found through `server-runtime.json`. T3 ids are unique only within one T3, so the daemon keys every project by `ProjectRef`, its machine and its T3 id. Thread ids stay plain, because every thread reference travels inside a project's scope.
 
-Each machine has its own `T3Api`, credential, and state folder. Nothing is shared between machines. `seirei login` saves the credential to `<config_dir>/credentials/<machine>.json`. A token from `$SEIREI_T3_TOKEN` or `t3_token` applies to `local` only.
+Each machine has its own `T3Api`, credential, and state folder. Nothing is shared between machines. A login's credential is saved to `<config_dir>/credentials/<machine>.json`. A token from `$SEIREI_T3_TOKEN` or `t3_token` applies to `local` only.
 
 `ListProjects` asks every machine at once and waits at most 5 s for each. A machine that fails lists no projects and reports why: `NeedsLogin` for a missing, lapsed, or rejected credential, `Unreachable` when T3 does not answer, and `Failed` when it answers with something other than its projects. One machine never fails the whole call. A call goes out even without a credential, so a T3 that is down reads as unreachable rather than as a missing login.
 
-Other machines live in `<config_dir>/machines.toml`, one table per machine with its `address` and an optional `coordinator_model`. `seirei machine add` and `remove` rewrite the whole file and restart a running daemon, the way `seirei login` does. A user may edit the file by hand. `local` is implicit and cannot be added or removed. Its `coordinator_model` stays in `config.toml`.
+Other machines live in `<config_dir>/machines.toml`, one table per machine with its `address` and an optional `coordinator_model`. `local` is implicit and cannot be added or removed. Its `coordinator_model` stays in `config.toml`. A user may edit the file by hand, and the daemon reads such an edit when it starts.
+
+The daemon owns machine changes. `AddMachine`, `RemoveMachine`, and `Login` are socket commands. `seirei machine add`, `seirei machine remove`, and `seirei login` are clients that send them, and they start the daemon when none runs. So while the daemon runs, it is the only writer of `machines.toml` and the credential files. A change takes one lock over the machine registry, writes the file, and updates the registry before it lets go. Two changes at once cannot lose each other's writes.
+
+A change takes effect at once, and connected TUIs stay connected. `AddMachine` parses the address in the daemon, so a bad address comes back as the parser's message and nothing is written. The daemon then opens the machine's connection with any credential saved for that address. `Login` pairs without holding the lock, because pairing waits on T3. It then saves the credential and swaps it into the machine's existing connection. The machine's project actors keep running, and their next call carries the new token over a new MCP session. `RemoveMachine` drops the connection, stops the machine's project actors, and closes the feed of every session that watches one of its projects. It deletes the machine's saved credential, so no working token stays on disk. The state folder stays, with the machine's identity and coordinator records, so adding the machine back keeps the duplicate rules and its coordinators. It needs a new login.
 
 For now seirei reaches other machines only over Tailscale. A `config::TailnetOrigin` is built only by its parse function, which accepts `https` with a host under `.ts.net` or a Tailscale IP, an optional port, and no path but `/mcp`. It keeps the bare origin. Tailscale Serve uses real certificates, so reqwest's rustls verifies them against the system's roots. The local T3 stays plain HTTP on loopback.
 
-A pairing code for a remote T3 has to be made on that machine, because seirei can only run the local `t3`. Without `--code`, `seirei login <machine>` asks for one on a terminal and fails without one. The OAuth flow then runs against that machine's origin.
+The daemon runs the OAuth flow against the machine's origin. For `local` without a code, it makes one with the local `t3`. A pairing code for a remote T3 has to be made on that machine, because seirei can only run the local `t3`. Without `--code`, `seirei login <machine>` asks for one on a terminal and sends it with `Login`. A `Login` for a remote without a code fails and says where to get one.
 
 Neither an address nor a host identifies a T3. Two addresses can reach one T3, and one host can run two. A T3's identity is its `environmentId`. Every listing that reaches a machine reads it with `t3_environment_read`, and the daemon records it in the machine's `identity.json`. It reloads those files at start. Of the machines that share an `environmentId`, the first in `MachineId` order (`local`, then by name) owns that T3. Every other one is `Duplicate` of the owner, whether or not the owner answers right now. A duplicate lists no projects, starts no project actors, and refuses commands with a reply that names the owner. So one T3 never gets a second coordinator for a project under another name.
 

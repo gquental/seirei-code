@@ -16,7 +16,10 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::AbortHandle,
+};
 
 const MAX_CHARS: u32 = 4_000;
 /// Rows re-read from the previous page. A thread archived mid-scan shifts later rows up by one;
@@ -30,6 +33,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 pub struct ProjectHandle {
     inbox: mpsc::Sender<Msg>,
     view: Arc<watch::Sender<Option<Arc<ProjectView>>>>,
+    actor: Arc<AbortHandle>,
 }
 
 pub enum ProjectCommand {
@@ -60,8 +64,17 @@ impl ProjectHandle {
         let view = Arc::new(watch::Sender::new(None));
         let actor = Actor::new(api, at, state_dir, coordinator_model, view.clone())?;
         let (inbox, messages) = mpsc::channel(32);
-        tokio::spawn(actor.run(messages));
-        Ok(Self { inbox, view })
+        let actor = Arc::new(tokio::spawn(actor.run(messages)).abort_handle());
+        Ok(Self { inbox, view, actor })
+    }
+
+    /// Ends the actor at its next await, even mid-call to T3. Its records stay as last written.
+    pub fn stop(&self) {
+        self.actor.abort();
+    }
+
+    pub async fn stopped(&self) {
+        self.inbox.closed().await
     }
 
     pub fn view(&self) -> watch::Receiver<Option<Arc<ProjectView>>> {

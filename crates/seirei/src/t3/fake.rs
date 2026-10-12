@@ -1,4 +1,8 @@
-use super::{Environment, Launch, PageSize, Position, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage};
+use super::{
+    Environment, Launch, PageSize, Position, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage,
+    login::{Credentials, LoginError, PairingCode},
+};
+use crate::config::{Endpoint, Token};
 use seirei_proto::{
     ids::{ItemId, ModelId, ProjectId, ProviderInstanceId, RequestId, SendId, T3Time, ThreadId},
     model::{
@@ -14,6 +18,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, SystemTime},
 };
 use tokio::sync::watch;
 
@@ -24,8 +29,10 @@ pub struct FakeT3 {
 }
 
 pub struct State {
+    pub address: String,
     pub project: Project,
     pub access: Option<Access>,
+    pub token: Option<String>,
     pub down: Option<Down>,
     /// Unique per fake unless a test makes two share one, as two addresses for one T3 would.
     pub environment: Environment,
@@ -51,8 +58,10 @@ impl FakeT3 {
         static ENVIRONMENTS: AtomicUsize = AtomicUsize::new(0);
         let n = ENVIRONMENTS.fetch_add(1, Ordering::Relaxed);
         let state = State {
+            address: "http://fake.test".into(),
             project,
             access: None,
+            token: None,
             down: None,
             environment: Environment { environment_id: format!("environment-{n}"), label: format!("fake-{n}") },
             models: vec![opus()],
@@ -171,12 +180,43 @@ impl State {
 }
 
 impl T3Api for FakeT3 {
+    /// A T3 that lists one project, `fake`, and wants a login when there is no token.
+    fn connect(endpoint: Endpoint, token: Option<Token>) -> Self {
+        let root = "/fake".into();
+        let fake = Self::new(Project { id: ProjectId::new("fake"), title: "fake".into(), root, default_model: None });
+        fake.with(|state| {
+            state.address = endpoint.address();
+            state.down = token.is_none().then_some(Down::LoggedOut);
+            state.access = token.as_ref().and_then(|token| token.access);
+            state.token = token.map(|token| token.secret.0);
+        });
+        fake
+    }
+
     fn access(&self) -> Option<Access> {
         self.with(|state| state.access)
     }
 
+    /// Any code pairs, and the token names it.
+    async fn pair(&self, access: Access, code: PairingCode) -> Result<Credentials, LoginError> {
+        let code = match code {
+            PairingCode::Mint => "minted".into(),
+            PairingCode::Given(code) => code,
+        };
+        let expires_at = SystemTime::now() + Duration::from_secs(30 * 86_400);
+        Ok(Credentials { origin: self.address(), token: format!("token-{code}"), access, expires_at })
+    }
+
+    fn use_token(&self, token: Token) {
+        self.with(|state| {
+            state.down.take_if(|down| *down == Down::LoggedOut);
+            state.access = token.access;
+            state.token = Some(token.secret.0);
+        });
+    }
+
     fn address(&self) -> String {
-        "http://fake.test".into()
+        self.with(|state| state.address.clone())
     }
 
     async fn environment(&self) -> Result<Environment, T3Error> {

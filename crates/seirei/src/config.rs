@@ -13,7 +13,7 @@ use std::{
 };
 
 const MACHINES_HEADER: &str = "# The T3 servers seirei reaches besides this machine's own.\n\
-                               # `seirei machine add` and `seirei machine remove` rewrite this file.\n\n";
+                               # Seirei rewrites this file when you add or remove a machine.\n\n";
 
 pub struct Config {
     pub dir: PathBuf,
@@ -130,11 +130,6 @@ struct MachineEntry {
 
 type MachinesFile = BTreeMap<MachineId, MachineEntry>;
 
-pub enum Added {
-    New,
-    AlreadyThere,
-}
-
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let dirs = directories::ProjectDirs::from("", "", "seirei").context("no home directory")?;
@@ -162,58 +157,56 @@ impl Config {
             format!("no machine is named {id}; seirei knows {}", known.join(", "))
         })
     }
+}
 
-    pub fn credentials(&self, machine: &MachineId) -> PathBuf {
-        credentials(&self.dir, machine)
+/// Writes `id` at `origin` into `machines.toml` unless it is there already, and returns the
+/// machine as seirei now reaches it, with any credential saved for that origin.
+pub fn add_machine(dir: &Path, id: &MachineId, origin: &TailnetOrigin) -> anyhow::Result<MachineConfig> {
+    if id.is_local() {
+        bail!("{id} is this machine's own T3; seirei always has it");
     }
-
-    /// Adding the same name at the same address again changes nothing.
-    pub fn add_machine(&self, id: &MachineId, origin: &TailnetOrigin) -> anyhow::Result<Added> {
-        if id.is_local() {
-            bail!("{id} is this machine's own T3; seirei always has it");
+    let mut file = machines_file(dir)?;
+    match file.get(id) {
+        Some(held) if TailnetOrigin::parse(&held.address).ok().as_ref() == Some(origin) => {}
+        Some(held) => bail!("{id} is already at {}; remove it first to move it", held.address),
+        None => {
+            file.insert(id.clone(), MachineEntry { address: origin.to_string(), coordinator_model: None });
+            write_machines(dir, &file)?;
         }
-        let mut file = machines_file(&self.dir)?;
-        let entry = MachineEntry { address: origin.to_string(), coordinator_model: None };
-        match file.get(id) {
-            Some(held) if TailnetOrigin::parse(&held.address).ok().as_ref() == Some(origin) => {
-                return Ok(Added::AlreadyThere);
-            }
-            Some(held) => bail!("{id} is already at {}; remove it first to move it", held.address),
-            None => file.insert(id.clone(), entry),
-        };
-        self.write_machines(&file)?;
-        Ok(Added::New)
     }
+    remote_machine(dir, id, &file[id])
+}
 
-    pub fn remove_machine(&self, id: &MachineId) -> anyhow::Result<()> {
-        if id.is_local() {
-            bail!("{id} is this machine's own T3; seirei always has it");
-        }
-        let mut file = machines_file(&self.dir)?;
-        if file.remove(id).is_none() {
-            self.machine(id)?;
-        }
-        self.write_machines(&file)
+/// Whether `machines.toml` named `id`.
+pub fn remove_machine(dir: &Path, id: &MachineId) -> anyhow::Result<bool> {
+    if id.is_local() {
+        bail!("{id} is this machine's own T3; seirei always has it");
     }
+    let mut file = machines_file(dir)?;
+    let held = file.remove(id).is_some();
+    if held {
+        write_machines(dir, &file)?;
+    }
+    Ok(held)
+}
 
-    fn write_machines(&self, file: &MachinesFile) -> anyhow::Result<()> {
-        let path = self.dir.join("machines.toml");
-        let text = format!("{MACHINES_HEADER}{}", toml::to_string(file).context("writing machines.toml")?);
-        crate::write_private(&path, text.as_bytes()).with_context(|| format!("writing {}", path.display()))
-    }
+fn write_machines(dir: &Path, file: &MachinesFile) -> anyhow::Result<()> {
+    let path = dir.join("machines.toml");
+    let text = format!("{MACHINES_HEADER}{}", toml::to_string(file).context("writing machines.toml")?);
+    crate::write_private(&path, text.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
 fn remote_machines(dir: &Path) -> anyhow::Result<Vec<MachineConfig>> {
-    let mut machines = Vec::new();
-    for (id, entry) in machines_file(dir)? {
-        let parsed = (TailnetOrigin::parse(&entry.address).map(Endpoint::Tailnet))
-            .and_then(|endpoint| Ok((endpoint, entry.coordinator_model.as_deref().map(model_selection).transpose()?)));
-        let (endpoint, coordinator_model) =
-            parsed.with_context(|| format!("parsing [{id}] in {}", dir.join("machines.toml").display()))?;
-        let token = saved_token(&credentials(dir, &id), &endpoint)?;
-        machines.push(MachineConfig { id, endpoint, token, coordinator_model });
-    }
-    Ok(machines)
+    machines_file(dir)?.iter().map(|(id, entry)| remote_machine(dir, id, entry)).collect()
+}
+
+fn remote_machine(dir: &Path, id: &MachineId, entry: &MachineEntry) -> anyhow::Result<MachineConfig> {
+    let parsed = (TailnetOrigin::parse(&entry.address).map(Endpoint::Tailnet))
+        .and_then(|endpoint| Ok((endpoint, entry.coordinator_model.as_deref().map(model_selection).transpose()?)));
+    let (endpoint, coordinator_model) =
+        parsed.with_context(|| format!("parsing [{id}] in {}", dir.join("machines.toml").display()))?;
+    let token = saved_token(&credentials(dir, id), &endpoint)?;
+    Ok(MachineConfig { id: id.clone(), endpoint, token, coordinator_model })
 }
 
 fn machines_file(dir: &Path) -> anyhow::Result<MachinesFile> {
@@ -225,7 +218,7 @@ fn machines_file(dir: &Path) -> anyhow::Result<MachinesFile> {
     Ok(file)
 }
 
-fn credentials(dir: &Path, machine: &MachineId) -> PathBuf {
+pub fn credentials(dir: &Path, machine: &MachineId) -> PathBuf {
     dir.join("credentials").join(format!("{machine}.json"))
 }
 
@@ -338,21 +331,26 @@ mod tests {
     #[test]
     fn machines_are_added_and_removed_in_machines_toml_and_find_their_credentials() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let config = Config { dir: dir.path().to_path_buf(), state_dir: dir.path().join("state"), machines: vec![] };
         let macbook = MachineId::parse("macbook").unwrap();
         let at = TailnetOrigin::parse("https://macbook-pro-de-gui.tail123b88.ts.net:4043/").unwrap();
-        assert!(matches!(config.add_machine(&macbook, &at), Ok(Added::New)));
-        assert!(matches!(config.add_machine(&macbook, &at), Ok(Added::AlreadyThere)), "adding again changes nothing");
-        let elsewhere = TailnetOrigin::parse("https://macbook-pro-de-gui.tail123b88.ts.net").unwrap();
-        assert!(config.add_machine(&macbook, &elsewhere).is_err(), "a name keeps its address until removed");
-        assert!(config.add_machine(&MachineId::local(), &at).is_err(), "local is implicit");
-
+        let added = add_machine(dir.path(), &macbook, &at).expect("added");
+        assert!((added.endpoint.address(), added.token.is_none()) == (at.to_string(), true), "not paired yet");
         let path = dir.path().join("machines.toml");
-        let edited = std::fs::read_to_string(&path).unwrap() + "coordinator_model = \"codex/gpt-6.1-sol\"\n";
-        std::fs::write(&path, edited).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let elsewhere = TailnetOrigin::parse("https://macbook-pro-de-gui.tail123b88.ts.net").unwrap();
+        assert!(add_machine(dir.path(), &macbook, &elsewhere).is_err(), "a name keeps its address until removed");
+        assert!(add_machine(dir.path(), &MachineId::local(), &at).is_err(), "local is implicit");
+
+        let edited = written + "coordinator_model = \"codex/gpt-6.1-sol\"\n";
+        std::fs::write(&path, &edited).unwrap();
         save(&credentials(dir.path(), &macbook), at.as_str(), SystemTime::now() + Duration::from_secs(3600));
+        let again = add_machine(dir.path(), &macbook, &at).expect("adding again changes nothing");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "the file is left as it was");
+        let model = again.coordinator_model.as_ref().map(|model| model.model.as_str());
+        assert_eq!((again.token.is_some(), model), (true, Some("gpt-6.1-sol")), "it is read back as written");
         let studio = MachineId::parse("studio").unwrap();
-        config.add_machine(&studio, &TailnetOrigin::parse("https://mac-studio.tail123b88.ts.net").unwrap()).unwrap();
+        add_machine(dir.path(), &studio, &TailnetOrigin::parse("https://mac-studio.tail123b88.ts.net").unwrap())
+            .unwrap();
         save(
             &credentials(dir.path(), &studio),
             "https://elsewhere.tail123b88.ts.net",
@@ -375,8 +373,9 @@ mod tests {
             "a rewrite keeps a hand-added key, and a credential for another origin is not used"
         );
 
-        config.remove_machine(&macbook).expect("removed");
-        assert!(config.remove_machine(&macbook).is_err(), "an unknown name is an error, not a silent no-op");
+        assert!(remove_machine(dir.path(), &macbook).expect("removed"));
+        assert!(!remove_machine(dir.path(), &macbook).expect("nothing to remove"), "the file no longer names it");
+        assert!(remove_machine(dir.path(), &MachineId::local()).is_err(), "local is implicit");
         let left: Vec<String> = remote_machines(dir.path()).unwrap().iter().map(|m| m.id.to_string()).collect();
         assert_eq!(left, ["studio"]);
 
