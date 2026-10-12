@@ -70,7 +70,7 @@ Seirei asks for a pairing code. The code has to come from that machine, so creat
 
 ## Keys
 
-In the picker, `j` and `k` move, `Enter` opens a project, and `q` quits.
+The picker lists projects under one line per machine. That line says whether seirei reaches the machine, and what to run when it does not. `j` and `k` move between projects, `Enter` opens one, and `q` quits.
 
 In a project pane:
 

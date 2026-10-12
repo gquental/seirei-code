@@ -241,10 +241,6 @@ impl App {
             .find_map(|(_, action, _)| p.denied(context, action).filter(|_| p.ready(context, action, up)))
     }
 
-    pub fn loading_projects(&self) -> bool {
-        self.calls.values().any(|p| matches!(p, Purpose::ListProjects))
-    }
-
     fn on_server(&mut self, msg: ServerMsg) -> Vec<Effect> {
         match msg {
             ServerMsg::Welcome => {
