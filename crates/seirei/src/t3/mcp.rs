@@ -11,7 +11,7 @@ use seirei_proto::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -48,17 +48,35 @@ enum Posted {
     SessionGone,
 }
 
+const RUNTIME_FILE: &str = "userdata/server-runtime.json";
+
 #[derive(Deserialize)]
 struct RuntimeFile {
     origin: String,
+    pid: Option<u32>,
 }
 
 pub fn origin(t3_home: &Path) -> Result<String, T3Error> {
-    let path = t3_home.join("userdata/server-runtime.json");
+    let path = t3_home.join(RUNTIME_FILE);
     let text = std::fs::read_to_string(&path).map_err(|e| T3Error::Unreachable(format!("{}: {e}", path.display())))?;
     let runtime: RuntimeFile =
         serde_json::from_str(&text).map_err(|e| T3Error::Unreachable(format!("{}: {e}", path.display())))?;
     Ok(runtime.origin.trim_end_matches('/').to_owned())
+}
+
+/// The executable of the T3 serving `t3_home`, else `t3` on PATH. Only the server's own CLI is
+/// sure to mint codes with scopes that server grants: an older `t3` on PATH can name a scope the
+/// server dropped, and the server then burns the code without granting any access.
+fn cli(t3_home: &Path) -> PathBuf {
+    let runtime = std::fs::read_to_string(t3_home.join(RUNTIME_FILE)).ok();
+    let pid = runtime.and_then(|text| serde_json::from_str::<RuntimeFile>(&text).ok()).and_then(|runtime| runtime.pid);
+    t3_cli(pid.and_then(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).ok()))
+}
+
+/// A server run by node or Electron resolves to that runtime, which has no `auth` command.
+fn t3_cli(server_exe: Option<PathBuf>) -> PathBuf {
+    let is_t3 = |exe: &PathBuf| exe.file_name().is_some_and(|name| name == "t3") && exe.is_file();
+    server_exe.filter(is_t3).unwrap_or_else(|| "t3".into())
 }
 
 impl McpT3 {
@@ -210,7 +228,11 @@ impl T3Api for McpT3 {
     async fn pair(&self, access: Access, code: PairingCode) -> Result<Credentials, LoginError> {
         let origin = (self.endpoint.origin())
             .map_err(|e| LoginError::Unreachable { origin: self.endpoint.address(), detail: e.to_string() })?;
-        login::login(&origin, access, code).await
+        let cli = match &self.endpoint {
+            Endpoint::Local { t3_home } => cli(t3_home),
+            Endpoint::Tailnet(_) => "t3".into(),
+        };
+        login::login(&origin, &cli, access, code).await
     }
 
     fn use_token(&self, token: Token) {
@@ -438,6 +460,39 @@ mod tests {
             matches!(stopped, T3Error::NoSession(ref cause) if matches!(**cause, T3Error::Unreachable(_))),
             "{stopped:?}"
         );
+    }
+
+    #[test]
+    fn pairing_codes_come_from_the_running_servers_own_binary() {
+        let t3_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t3_home.path().join("userdata")).unwrap();
+        let runtime = |runtime: Value| {
+            std::fs::write(t3_home.path().join(RUNTIME_FILE), runtime.to_string()).unwrap();
+            cli(t3_home.path())
+        };
+        let origin = "http://127.0.0.1:3773";
+        assert_eq!(
+            runtime(json!({ "origin": origin, "pid": std::process::id() })),
+            Path::new("t3"),
+            "a server whose binary is not t3 has no auth command"
+        );
+        assert_eq!(runtime(json!({ "origin": origin })), Path::new("t3"), "no pid names no server");
+        assert_eq!(runtime(json!({ "origin": origin, "pid": u32::MAX })), Path::new("t3"), "that server is gone");
+        std::fs::remove_file(t3_home.path().join(RUNTIME_FILE)).unwrap();
+        assert_eq!(cli(t3_home.path()), Path::new("t3"), "no runtime file names no server");
+    }
+
+    #[test]
+    fn only_a_binary_named_t3_mints_pairing_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let t3 = dir.path().join("t3");
+        let node = dir.path().join("node");
+        std::fs::write(&t3, "").unwrap();
+        std::fs::write(&node, "").unwrap();
+        assert_eq!(t3_cli(Some(t3.clone())), t3);
+        assert_eq!(t3_cli(Some(node)), Path::new("t3"), "node runs the server but has no auth command");
+        assert_eq!(t3_cli(Some(dir.path().join("gone/t3"))), Path::new("t3"), "a deleted binary falls back");
+        assert_eq!(t3_cli(None), Path::new("t3"));
     }
 
     #[test]

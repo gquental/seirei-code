@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     io,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -27,8 +27,8 @@ pub enum PairingCode {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoginError {
-    #[error("could not create a pairing code with `t3 auth pairing create`: {0}")]
-    Pairing(String),
+    #[error("could not create a pairing code with `{} auth pairing create`: {detail}", .cli.display())]
+    Pairing { cli: PathBuf, detail: String },
     #[error("T3 refused the login: {0}")]
     Refused(String),
     #[error("T3 is unreachable at {origin}: {detail}")]
@@ -37,9 +37,9 @@ pub enum LoginError {
     Save(#[from] std::io::Error),
 }
 
-pub async fn login(origin: &str, access: Access, code: PairingCode) -> Result<Credentials, LoginError> {
+pub async fn login(origin: &str, cli: &Path, access: Access, code: PairingCode) -> Result<Credentials, LoginError> {
     let code = match code {
-        PairingCode::Mint => pairing_code().await?,
+        PairingCode::Mint => pairing_code(cli).await?,
         PairingCode::Given(code) => code,
     };
     let http = reqwest::Client::new();
@@ -89,20 +89,21 @@ struct Issued {
     expires_in: u64,
 }
 
-async fn pairing_code() -> Result<String, LoginError> {
+async fn pairing_code(cli: &Path) -> Result<String, LoginError> {
     #[derive(Deserialize)]
     struct Pairing {
         credential: String,
     }
-    let output = (tokio::process::Command::new("t3"))
+    let failed = |detail: String| LoginError::Pairing { cli: cli.to_owned(), detail };
+    let output = (tokio::process::Command::new(cli))
         .args(["auth", "pairing", "create", "--json", "--label", "seirei"])
         .output()
         .await
-        .map_err(|e| LoginError::Pairing(e.to_string()))?;
+        .map_err(|e| failed(e.to_string()))?;
     if !output.status.success() {
-        return Err(LoginError::Pairing(String::from_utf8_lossy(&output.stderr).trim().to_owned()));
+        return Err(failed(String::from_utf8_lossy(&output.stderr).trim().to_owned()));
     }
-    let pairing: Pairing = serde_json::from_slice(&output.stdout).map_err(|e| LoginError::Pairing(e.to_string()))?;
+    let pairing: Pairing = serde_json::from_slice(&output.stdout).map_err(|e| failed(e.to_string()))?;
     Ok(pairing.credential)
 }
 
