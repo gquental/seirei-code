@@ -1,5 +1,5 @@
 use super::{Launch, PageSize, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage, wire};
-use crate::config::{Config, Token};
+use crate::config::Token;
 use seirei_proto::{
     ids::{ProjectId, RequestId, SendId, ThreadId},
     model::{Access, Answers, ModelSelection, PendingRequest, Project, ThreadSummary},
@@ -19,7 +19,8 @@ pub struct McpT3 {
     http: reqwest::Client,
     t3_home: PathBuf,
     /// A 401 is reported as `Unauthorized`, never retried: only `seirei login` mints a token,
-    /// because a CLI-issued session is capped at `approval-required`.
+    /// because a CLI-issued session is capped at `approval-required`. Without a token, calls still
+    /// go out, so a T3 that is down reads as unreachable rather than as a missing login.
     token: Option<Token>,
     session: tokio::sync::Mutex<Option<Session>>,
     next_id: AtomicU64,
@@ -51,19 +52,13 @@ pub fn origin(t3_home: &Path) -> Result<String, T3Error> {
 }
 
 impl McpT3 {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(t3_home: PathBuf, token: Option<Token>) -> Self {
         let http = (reqwest::Client::builder())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
             .build()
             .expect("a client without TLS or proxies always builds");
-        Self {
-            http,
-            t3_home: config.t3_home.clone(),
-            token: config.token.clone(),
-            session: Default::default(),
-            next_id: AtomicU64::new(1),
-        }
+        Self { http, t3_home, token, session: Default::default(), next_id: AtomicU64::new(1) }
     }
 
     /// Null arguments are dropped: T3's validators reject an explicit `null` for an optional
@@ -127,11 +122,12 @@ impl McpT3 {
     }
 
     async fn post(&self, endpoint: &str, session: Option<&str>, body: &Value) -> Result<Posted, T3Error> {
-        let token = self.token.as_ref().ok_or(T3Error::Unauthorized)?;
         let mut request = (self.http.post(endpoint))
-            .bearer_auth(&token.secret.0)
             .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
             .json(body);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(&token.secret.0);
+        }
         if let Some(id) = session {
             request = request.header(SESSION_HEADER, id).header("mcp-protocol-version", PROTOCOL);
         }
@@ -180,6 +176,10 @@ fn tool_result(mut body: Value) -> Result<Value, T3Error> {
 impl T3Api for McpT3 {
     fn access(&self) -> Option<Access> {
         self.token.as_ref().and_then(|token| token.access)
+    }
+
+    fn address(&self) -> String {
+        origin(&self.t3_home).unwrap_or_else(|_| self.t3_home.display().to_string())
     }
 
     async fn projects(&self) -> Result<Vec<Project>, T3Error> {
@@ -296,7 +296,7 @@ mod tests {
     struct Stub {
         t3: McpT3,
         methods: Arc<Mutex<Vec<String>>>,
-        _t3_home: tempfile::TempDir,
+        t3_home: tempfile::TempDir,
     }
 
     async fn stub(respond: Respond) -> Stub {
@@ -313,14 +313,8 @@ mod tests {
                 tokio::spawn(exchange(stream, respond, seen.clone()));
             }
         });
-        let config = Config {
-            t3_home: t3_home.path().to_path_buf(),
-            state_dir: PathBuf::new(),
-            credentials: PathBuf::new(),
-            token: Some(Token { secret: Secret("stub".into()), access: None }),
-            coordinator_model: None,
-        };
-        Stub { t3: McpT3::new(&config), methods, _t3_home: t3_home }
+        let token = Token { secret: Secret("stub".into()), access: None };
+        Stub { t3: McpT3::new(t3_home.path().to_path_buf(), Some(token)), methods, t3_home }
     }
 
     async fn exchange(mut stream: TcpStream, respond: Respond, seen: Arc<Mutex<Vec<String>>>) {
@@ -364,6 +358,27 @@ mod tests {
         assert!(failed.to_string().contains("cannot parse"), "the error says what happened: {failed}");
         assert!(!failed.may_have_applied(), "the answer never left, so a retry is safe: {failed}");
         assert_eq!(*stub.methods.lock().unwrap(), ["initialize"]);
+    }
+
+    #[tokio::test]
+    async fn without_a_token_a_running_t3_needs_a_login_and_a_stopped_one_is_unreachable() {
+        let stub = stub(|_| (401, None, r#"{"error":"invalid_mcp_credential"}"#.into())).await;
+        let anonymous = McpT3::new(stub.t3_home.path().to_path_buf(), None);
+        let refused = anonymous.projects().await.expect_err("T3 wants a credential");
+        assert!(
+            matches!(refused, T3Error::NoSession(ref cause) if matches!(**cause, T3Error::Unauthorized)),
+            "{refused:?}"
+        );
+        assert_eq!(*stub.methods.lock().unwrap(), ["initialize"], "the call went out without a token");
+
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let runtime = json!({ "origin": format!("http://{closed}") });
+        std::fs::write(stub.t3_home.path().join("userdata/server-runtime.json"), runtime.to_string()).unwrap();
+        let stopped = anonymous.projects().await.expect_err("nothing listens");
+        assert!(
+            matches!(stopped, T3Error::NoSession(ref cause) if matches!(**cause, T3Error::Unreachable(_))),
+            "{stopped:?}"
+        );
     }
 
     #[test]
@@ -415,7 +430,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a running T3 and a token in SEIREI_T3_TOKEN"]
     async fn live_scan_and_tail_read_parse() {
-        let t3 = McpT3::new(&Config::load().expect("the config loads"));
+        let config = crate::config::Config::load().expect("the config loads");
+        let local = config.machine(&seirei_proto::ids::MachineId::local()).expect("local is always configured");
+        let t3 = McpT3::new(local.t3_home.clone(), local.token.clone());
         let mut busiest: Option<ThreadSummary> = None;
         for project in t3.projects().await.expect("projects list") {
             let (mut rows, mut unparsed, mut pages, mut cursor) = (0, Vec::new(), 0, None);

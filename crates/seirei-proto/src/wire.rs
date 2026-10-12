@@ -6,8 +6,8 @@
 //! replayed, sequenced, or diffed.
 
 use crate::{
-    ids::{ProjectId, RequestId, SendId, ThreadId},
-    model::{Answers, Project, ProjectView},
+    ids::{ProjectRef, RequestId, SendId, ThreadId},
+    model::{Answers, MachineProjects, ProjectView},
     timeline::Timeline,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -61,28 +61,29 @@ pub enum ClientMsg {
 /// adds one job timeline.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
-    pub project: Option<ProjectId>,
+    pub project: Option<ProjectRef>,
     pub job: Option<ThreadId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Command {
+    /// Every machine with its status, and the projects of those seirei reached.
     ListProjects,
     /// Idempotent: returns the existing coordinator, adopts one whose launch was never recorded,
     /// or launches one.
     EnsureCoordinator {
-        project: ProjectId,
+        project: ProjectRef,
     },
     /// Idempotent per `send_id`.
     Send {
-        project: ProjectId,
+        project: ProjectRef,
         thread: ThreadId,
         text: String,
         send_id: SendId,
     },
     Answer {
-        project: ProjectId,
+        project: ProjectRef,
         request: RequestId,
         answers: Answers,
     },
@@ -112,7 +113,7 @@ pub enum ServerMsg {
 #[serde(rename_all = "snake_case")]
 pub enum Reply {
     Done,
-    Projects(Vec<Project>),
+    Projects(Vec<MachineProjects>),
 }
 
 /// Why a call failed, phrased for the user. `retry_safe` is true whenever repeating the exact

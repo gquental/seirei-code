@@ -16,6 +16,9 @@ use std::{collections::BTreeMap, future::Future};
 pub trait T3Api: Send + Sync + 'static {
     fn access(&self) -> Option<Access>;
 
+    /// Where this T3 is reached, for display.
+    fn address(&self) -> String;
+
     fn projects(&self) -> impl Future<Output = Result<Vec<Project>, T3Error>> + Send;
 
     fn models(&self) -> impl Future<Output = Result<Vec<ModelSelection>, T3Error>> + Send;

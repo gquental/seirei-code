@@ -1,4 +1,4 @@
-use crate::ids::{ModelId, ProjectId, ProviderInstanceId, RequestId, T3Time, ThreadId};
+use crate::ids::{MachineId, ModelId, ProjectId, ProjectRef, ProviderInstanceId, RequestId, T3Time, ThreadId};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
 
@@ -8,6 +8,89 @@ pub struct Project {
     pub title: String,
     pub root: PathBuf,
     pub default_model: Option<ModelSelection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Machine {
+    pub id: MachineId,
+    /// Where seirei reaches its T3, for display.
+    pub address: String,
+    /// T3's own name for the server, once seirei has reached it.
+    pub label: Option<String>,
+    pub status: MachineStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineStatus {
+    Connected,
+    /// No credential, a lapsed one, or one T3 rejected.
+    NeedsLogin,
+    /// T3 did not answer.
+    Unreachable {
+        detail: String,
+    },
+    /// T3 answered, but not with its projects.
+    Failed {
+        detail: String,
+    },
+    /// The same T3 as `of`, which comes first in `MachineId` order. It lists no projects, so
+    /// each project appears once.
+    Duplicate {
+        of: MachineId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MachineProjects {
+    pub machine: Machine,
+    pub projects: Vec<Project>,
+}
+
+/// Finds the project `name` names, written `[machine/]project` with the project by title or
+/// id. A bare name must match on exactly one machine.
+pub fn find_project(listing: &[MachineProjects], name: &str) -> Result<ProjectRef, String> {
+    let named = |project: &Project, wanted: &str| project.title == wanted || project.id.as_str() == wanted;
+    let qualified = name.split_once('/').and_then(|(machine, wanted)| {
+        let listed = listing.iter().find(|listed| listed.machine.id.as_str() == machine)?;
+        Some((listed, wanted))
+    });
+    if let Some((listed, wanted)) = qualified {
+        let machine = &listed.machine;
+        return match listed.projects.iter().find(|project| named(project, wanted)) {
+            Some(project) => Ok(ProjectRef { machine: machine.id.clone(), project: project.id.clone() }),
+            None if machine.status == MachineStatus::Connected => {
+                Err(format!("{} has no project titled {wanted:?} or with that id", machine.id))
+            }
+            None => Err(format!("{} lists no projects: {}", machine.id, machine.status_text())),
+        };
+    }
+    let found: Vec<ProjectRef> = (listing.iter())
+        .flat_map(|listed| listed.projects.iter().map(move |project| (&listed.machine, project)))
+        .filter(|(_, project)| named(project, name))
+        .map(|(machine, project)| ProjectRef { machine: machine.id.clone(), project: project.id.clone() })
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("no machine has a project titled {name:?} or with that id")),
+        several => {
+            let names: Vec<String> = several.iter().map(|at| format!("{}/{name}", at.machine)).collect();
+            Err(format!("{name:?} is on more than one machine; name one of {}", names.join(", ")))
+        }
+    }
+}
+
+impl Machine {
+    /// The status in words, with what would fix it.
+    pub fn status_text(&self) -> String {
+        match &self.status {
+            MachineStatus::Connected => "connected".into(),
+            MachineStatus::NeedsLogin => "needs login: run `seirei login`".into(),
+            MachineStatus::Unreachable { detail } => format!("unreachable: {detail}"),
+            MachineStatus::Failed { detail } => format!("failed: {detail}"),
+            MachineStatus::Duplicate { of } => format!("the same T3 as {of}, so its projects are listed there"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +220,7 @@ pub enum CoordinatorView {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectView {
+    pub machine: MachineId,
     pub project: Project,
     pub coordinator: CoordinatorView,
     /// Live jobs first, then most recently updated.
@@ -213,6 +297,45 @@ mod tests {
         assert_eq!(allowed(Access::ApprovalRequired), [ApprovalRequired]);
         assert_eq!(allowed(Access::Auto), [ApprovalRequired, AutoAcceptEdits, Auto]);
         assert_eq!(allowed(Access::FullAccess), [ApprovalRequired, AutoAcceptEdits, Auto, FullAccess]);
+    }
+
+    fn listed(machine: &str, status: MachineStatus, titles: &[&str]) -> MachineProjects {
+        let id = MachineId::parse(machine).expect("a machine name");
+        let projects = (titles.iter())
+            .map(|title| Project {
+                id: ProjectId::new(format!("{machine}-{title}")),
+                title: title.to_string(),
+                root: PathBuf::from(format!("/src/{title}")),
+                default_model: None,
+            })
+            .collect();
+        MachineProjects { machine: Machine { id, address: String::new(), label: None, status }, projects }
+    }
+
+    #[test]
+    fn a_project_is_found_by_title_or_id_and_qualified_when_ambiguous() {
+        let listing = [
+            listed("local", MachineStatus::Connected, &["seirei-code", "notes"]),
+            listed("macbook", MachineStatus::Connected, &["seirei-code", "photos"]),
+            listed("studio", MachineStatus::NeedsLogin, &[]),
+        ];
+        let at = |machine: &str, project: &str| ProjectRef {
+            machine: MachineId::parse(machine).unwrap(),
+            project: ProjectId::new(project),
+        };
+        assert_eq!(find_project(&listing, "photos"), Ok(at("macbook", "macbook-photos")));
+        assert_eq!(find_project(&listing, "local-notes"), Ok(at("local", "local-notes")), "by id");
+        assert_eq!(find_project(&listing, "macbook/seirei-code"), Ok(at("macbook", "macbook-seirei-code")));
+        assert_eq!(find_project(&listing, "local/local-notes"), Ok(at("local", "local-notes")));
+
+        let ambiguous = find_project(&listing, "seirei-code").expect_err("on two machines");
+        assert!(ambiguous.contains("local/seirei-code, macbook/seirei-code"), "{ambiguous}");
+        let missing = find_project(&listing, "macbook/notes").expect_err("notes is local");
+        assert_eq!(missing, "macbook has no project titled \"notes\" or with that id");
+        let locked = find_project(&listing, "studio/anything").expect_err("studio lists nothing");
+        assert!(locked.contains("needs login"), "{locked}");
+        assert!(find_project(&listing, "nowhere").is_err());
+        assert!(find_project(&listing, "elsewhere/notes").is_err(), "an unknown machine qualifies nothing");
     }
 
     #[test]

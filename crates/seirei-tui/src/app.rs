@@ -1,10 +1,10 @@
 use crate::keymap::{self, Action, Context};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use seirei_proto::{
-    ids::{ProjectId, RequestId, SendId, ThreadId},
+    ids::{ProjectRef, RequestId, SendId, ThreadId},
     model::{
-        Access, Answer, Answers, CoordinatorView, Job, PendingRequest, Project, ProjectView, Question, RuntimeMode,
-        ThreadSummary,
+        self, Access, Answer, Answers, CoordinatorView, Job, Machine, MachineProjects, PendingRequest, Project,
+        ProjectView, Question, RuntimeMode, ThreadSummary,
     },
     timeline::Timeline,
     wire::{BuildId, CallError, CallId, ClientMsg, Command, Reply, ServerMsg, Subscription},
@@ -43,7 +43,7 @@ pub enum Link {
 pub struct App {
     pub link: Link,
     pub screen: Screen,
-    pub projects: Vec<Project>,
+    pub projects: Vec<MachineProjects>,
     pub help: bool,
     pub notice: Option<String>,
     build: BuildId,
@@ -67,7 +67,7 @@ pub enum Screen {
 }
 
 pub struct ProjectScreen {
-    pub id: ProjectId,
+    pub id: ProjectRef,
     pub view: Option<Arc<ProjectView>>,
     pub timelines: HashMap<ThreadId, Arc<Timeline>>,
     pub focus: Focus,
@@ -157,6 +157,11 @@ impl App {
         }
     }
 
+    /// Every project the picker offers, machine by machine.
+    pub fn listed(&self) -> impl Iterator<Item = (&Machine, &Project)> {
+        listed(&self.projects)
+    }
+
     pub fn subscription(&self) -> Subscription {
         let Screen::Project(p) = &self.screen else { return Subscription::default() };
         let job = match &p.focus {
@@ -191,7 +196,7 @@ impl App {
         match (self.context(), action) {
             (_, Action::Quit | Action::ToggleHelp) => true,
             (Context::WrongBuild, Action::TakeOver) => !self.take_over,
-            (Context::Picker, Action::Up | Action::Down | Action::Open) => !self.projects.is_empty(),
+            (Context::Picker, Action::Up | Action::Down | Action::Open) => self.listed().next().is_some(),
             (context, action) => match &self.screen {
                 Screen::Project(p) => p.live(context, action, self.link == Link::Up),
                 Screen::Picker { .. } => false,
@@ -257,7 +262,7 @@ impl App {
             }
             ServerMsg::Project(view) => {
                 if let Screen::Project(p) = &mut self.screen
-                    && p.id == view.project.id
+                    && (&p.id.machine, &p.id.project) == (&view.machine, &view.project.id)
                     && let Some(notice) = p.accept_view(view)
                 {
                     self.notice = Some(notice);
@@ -281,8 +286,9 @@ impl App {
         match (purpose, result) {
             (Purpose::ListProjects, Ok(Reply::Projects(projects))) => {
                 self.projects = projects;
+                let listed = self.listed().count();
                 if let Screen::Picker { cursor } = &mut self.screen {
-                    *cursor = (*cursor).min(self.projects.len().saturating_sub(1));
+                    *cursor = (*cursor).min(listed.saturating_sub(1));
                 }
                 self.open_named()
             }
@@ -313,15 +319,14 @@ impl App {
 
     fn open_named(&mut self) {
         let Some(name) = self.open.take() else { return };
-        match self.projects.iter().position(|p| p.title == name || p.id.as_str() == name) {
-            Some(index) => self.enter(index),
-            None => self.notice = Some(format!("No project named \"{name}\".")),
+        match model::find_project(&self.projects, &name) {
+            Ok(at) => self.enter(at),
+            Err(e) => self.notice = Some(format!("Cannot open {name}: {e}.")),
         }
     }
 
-    fn enter(&mut self, index: usize) {
-        let Some(project) = self.projects.get(index) else { return };
-        self.screen = Screen::Project(Box::new(ProjectScreen::new(project.id.clone(), self.send_ids.next())));
+    fn enter(&mut self, at: ProjectRef) {
+        self.screen = Screen::Project(Box::new(ProjectScreen::new(at, self.send_ids.next())));
     }
 
     fn act(&mut self, action: Action) -> Vec<Effect> {
@@ -340,10 +345,16 @@ impl App {
                 let Screen::Picker { cursor } = &mut self.screen else { return vec![] };
                 match action {
                     Action::Up => *cursor = cursor.saturating_sub(1),
-                    Action::Down => *cursor = (*cursor + 1).min(self.projects.len().saturating_sub(1)),
+                    Action::Down => *cursor = (*cursor + 1).min(listed(&self.projects).count().saturating_sub(1)),
                     _ => {
                         let index = *cursor;
-                        self.enter(index);
+                        let picked = self.listed().nth(index).map(|(machine, project)| ProjectRef {
+                            machine: machine.id.clone(),
+                            project: project.id.clone(),
+                        });
+                        if let Some(at) = picked {
+                            self.enter(at);
+                        }
                     }
                 }
                 vec![]
@@ -362,7 +373,9 @@ impl App {
                     p.set_focus(Focus::Jobs);
                     return vec![];
                 }
-                let cursor = self.projects.iter().position(|project| project.id == p.id).unwrap_or(0);
+                let cursor = listed(&self.projects)
+                    .position(|(machine, project)| machine.id == p.id.machine && project.id == p.id.project)
+                    .unwrap_or(0);
                 self.screen = Screen::Picker { cursor };
                 vec![self.call(Purpose::ListProjects, Command::ListProjects)]
             }
@@ -474,7 +487,7 @@ impl Draft {
 }
 
 impl ProjectScreen {
-    fn new(id: ProjectId, send_id: SendId) -> Self {
+    fn new(id: ProjectRef, send_id: SendId) -> Self {
         Self {
             id,
             view: None,
@@ -696,6 +709,10 @@ impl AnswerForm {
     }
 }
 
+fn listed(projects: &[MachineProjects]) -> impl Iterator<Item = (&Machine, &Project)> {
+    (projects.iter()).flat_map(|listed| listed.projects.iter().map(move |project| (&listed.machine, project)))
+}
+
 fn wants(focus: &Focus, view: Option<&ProjectView>, thread: &ThreadId) -> bool {
     let open_job = matches!(focus, Focus::Job { thread: open, .. } if open == thread);
     let coordinator = match view.map(|v| &v.coordinator) {
@@ -715,6 +732,14 @@ mod tests {
     use super::*;
     use crate::fixtures::*;
     use crossterm::event::KeyCode::{Backspace, Char, Enter, Esc, Tab};
+    use seirei_proto::{
+        ids::{MachineId, ProjectId},
+        model::MachineStatus,
+    };
+
+    fn at(machine: &str, project: &str) -> ProjectRef {
+        ProjectRef { machine: MachineId::parse(machine).unwrap(), project: ProjectId::new(project) }
+    }
 
     fn press(app: &mut App, code: KeyCode) -> Vec<Effect> {
         app.update(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
@@ -769,11 +794,11 @@ mod tests {
             panic!("expected ListProjects, got {effects:?}")
         };
         assert_eq!(app.subscription(), Subscription::default());
-        app.update(reply(id, Ok(Reply::Projects(vec![project_meta("a", "alpha"), project_meta("b", "beta")]))));
+        app.update(reply(id, Ok(Reply::Projects(local(vec![project_meta("a", "alpha"), project_meta("b", "beta")])))));
 
         press(&mut app, Char('j'));
         press(&mut app, Enter);
-        assert_eq!(app.subscription(), Subscription { project: Some(ProjectId::new("b")), job: None });
+        assert_eq!(app.subscription(), Subscription { project: Some(at("local", "b")), job: None });
         assert_eq!(app.context(), Context::Browse);
     }
 
@@ -782,14 +807,36 @@ mod tests {
         let mut app = new_app(Some("beta"));
         let effects = app.update(Event::Server(ServerMsg::Welcome));
         let [(id, _)] = calls(&effects)[..] else { panic!() };
-        app.update(reply(id, Ok(Reply::Projects(vec![project_meta("a", "alpha"), project_meta("b", "beta")]))));
-        assert_eq!(project(&app).id, ProjectId::new("b"));
+        app.update(reply(id, Ok(Reply::Projects(local(vec![project_meta("a", "alpha"), project_meta("b", "beta")])))));
+        assert_eq!(project(&app).id, at("local", "b"));
 
         let effects = press(&mut app, Esc);
         assert!(matches!(app.screen, Screen::Picker { cursor: 1 }));
         let [(id, Command::ListProjects)] = calls(&effects)[..] else { panic!() };
-        app.update(reply(id, Ok(Reply::Projects(vec![project_meta("a", "alpha"), project_meta("b", "beta")]))));
+        app.update(reply(id, Ok(Reply::Projects(local(vec![project_meta("a", "alpha"), project_meta("b", "beta")])))));
         assert!(matches!(app.screen, Screen::Picker { .. }));
+    }
+
+    #[test]
+    fn a_name_on_two_machines_opens_only_when_qualified() {
+        let listing = || {
+            vec![
+                machine("local", MachineStatus::Connected, vec![project_meta("a", "seirei-code")]),
+                machine("studio", MachineStatus::Connected, vec![project_meta("b", "seirei-code")]),
+            ]
+        };
+        let opened = |name: &str| {
+            let mut app = new_app(Some(name));
+            let effects = app.update(Event::Server(ServerMsg::Welcome));
+            let [(id, _)] = calls(&effects)[..] else { panic!() };
+            app.update(reply(id, Ok(Reply::Projects(listing()))));
+            app
+        };
+        let ambiguous = opened("seirei-code");
+        assert!(matches!(ambiguous.screen, Screen::Picker { .. }));
+        let notice = ambiguous.notice.as_deref().unwrap_or_default();
+        assert!(notice.contains("local/seirei-code, studio/seirei-code"), "{notice}");
+        assert_eq!(project(&opened("studio/seirei-code")).id, at("studio", "b"));
     }
 
     #[test]
@@ -958,7 +1005,7 @@ mod tests {
         app.update(Event::Connected);
         app.update(Event::Server(ServerMsg::Welcome));
         assert_eq!(sent_id(&press(&mut app, Enter)), first);
-        assert_eq!(app.subscription(), Subscription { project: Some(ProjectId::new("p")), job: None });
+        assert_eq!(app.subscription(), Subscription { project: Some(at("local", "p")), job: None });
     }
 
     #[test]
@@ -980,7 +1027,11 @@ mod tests {
         other.project.id = ProjectId::new("elsewhere");
         other.coordinator = CoordinatorView::Absent;
         app.update(Event::Server(ServerMsg::Project(Arc::new(other))));
-        assert!(project(&app).coordinator().is_some());
+        let mut same_id_elsewhere = ready_view(vec![], vec![]);
+        same_id_elsewhere.machine = MachineId::parse("studio").unwrap();
+        same_id_elsewhere.coordinator = CoordinatorView::Absent;
+        app.update(Event::Server(ServerMsg::Project(Arc::new(same_id_elsewhere))));
+        assert!(project(&app).coordinator().is_some(), "a frame matches by machine and project");
 
         app.update(Event::Server(ServerMsg::Timeline(Arc::new(timeline("mcp:stranger", vec![])))));
         app.update(Event::Server(ServerMsg::Timeline(Arc::new(timeline(COORDINATOR, vec![])))));

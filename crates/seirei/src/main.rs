@@ -9,7 +9,8 @@ use seirei::{
     t3::login::{self, PairingCode},
 };
 use seirei_proto::{
-    model::{Access, CoordinatorView, Project, ProjectView},
+    ids::MachineId,
+    model::{self, Access, CoordinatorView, ProjectView},
     timeline::Timeline,
     wire::{self, BuildId, CallId, ClientMsg, Command, Reply, ServerMsg, Subscription},
 };
@@ -33,7 +34,7 @@ use tokio::{
 #[derive(Parser)]
 #[command(name = "seirei", version)]
 struct Cli {
-    /// Open this project directly, by title or id.
+    /// Open this project directly: `[machine/]project`, the project by title or id.
     project: Option<String>,
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -56,9 +57,9 @@ enum Cmd {
         #[arg(long)]
         code: Option<String>,
     },
-    /// Print what the daemon knows, as JSON: the project list, or one project's pane.
+    /// Print what the daemon knows, as JSON: every machine and its projects, or one project's pane.
     Status {
-        /// A project title or id.
+        /// `[machine/]project`, the project by title or id.
         project: Option<String>,
     },
 }
@@ -123,15 +124,13 @@ async fn stop_running() -> anyhow::Result<bool> {
 
 async fn login(access: Access, code: Option<String>) -> anyhow::Result<()> {
     let config = Config::load()?;
-    let origin = seirei::t3::origin(&config.t3_home)?;
+    let machine = config.machine(&MachineId::local())?;
+    let origin = seirei::t3::origin(&machine.t3_home)?;
     let credentials = login::login(&origin, access, code.map_or(PairingCode::Mint, PairingCode::Given)).await?;
-    login::save(&config.credentials, &credentials)?;
+    let path = config.credentials(&machine.id);
+    login::save(&path, &credentials)?;
     let days = credentials.expires_at.duration_since(SystemTime::now()).unwrap_or_default().as_secs() / 86_400;
-    println!(
-        "Saved a {} credential for {origin} to {}. It expires in {days} days.",
-        access.name(),
-        config.credentials.display()
-    );
+    println!("Saved a {} credential for {origin} to {}. It expires in {days} days.", access.name(), path.display());
     if stop_running().await? {
         println!("Stopped the running daemon; the next `seirei` starts one with the new credential.");
     }
@@ -154,8 +153,8 @@ async fn status(project: Option<String>) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&projects)?);
         return Ok(());
     };
-    let project = find_project(&projects, &wanted)?;
-    client.send(&ClientMsg::Subscribe(Subscription { project: Some(project.id.clone()), job: None })).await?;
+    let project = model::find_project(&projects, &wanted).map_err(|e| anyhow!(e))?;
+    client.send(&ClientMsg::Subscribe(Subscription { project: Some(project), job: None })).await?;
     let mut pane = Pane::default();
     let filled = tokio::time::timeout(Duration::from_secs(10), pane.fill(&mut client)).await;
     if pane.view.is_some() {
@@ -166,11 +165,6 @@ async fn status(project: Option<String>) -> anyhow::Result<()> {
         Err(_) if pane.view.is_some() => bail!("the coordinator's timeline did not arrive within 10 s"),
         Err(_) => bail!("no view of {wanted} within 10 s; the daemon log says why"),
     }
-}
-
-fn find_project<'a>(projects: &'a [Project], wanted: &str) -> anyhow::Result<&'a Project> {
-    (projects.iter().find(|project| project.id.as_str() == wanted || project.title == wanted))
-        .with_context(|| format!("T3 has no project titled {wanted:?} or with that id"))
 }
 
 #[derive(Serialize, Default)]

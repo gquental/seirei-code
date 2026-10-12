@@ -1,7 +1,7 @@
 use crate::t3::login;
 use anyhow::Context;
 use seirei_proto::{
-    ids::{ModelId, ProviderInstanceId},
+    ids::{MachineId, ModelId, ProviderInstanceId},
     model::{Access, ModelSelection},
 };
 use serde::Deserialize;
@@ -12,9 +12,15 @@ use std::{
 };
 
 pub struct Config {
-    pub t3_home: PathBuf,
+    pub dir: PathBuf,
     pub state_dir: PathBuf,
-    pub credentials: PathBuf,
+    /// `local` first, then by name.
+    pub machines: Vec<MachineConfig>,
+}
+
+pub struct MachineConfig {
+    pub id: MachineId,
+    pub t3_home: PathBuf,
     pub token: Option<Token>,
     pub coordinator_model: Option<ModelSelection>,
 }
@@ -36,20 +42,33 @@ struct File {
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let dirs = directories::ProjectDirs::from("", "", "seirei").context("no home directory")?;
-        let path = dirs.config_dir().join("config.toml");
+        let dir = dirs.config_dir().to_path_buf();
+        let path = dir.join("config.toml");
         let file = read_file(&path)?;
         let coordinator_model = (file.coordinator_model.as_deref().map(model_selection).transpose())
             .with_context(|| format!("parsing {}", path.display()))?;
         let home = directories::BaseDirs::new().context("no home directory")?.home_dir().to_path_buf();
         let t3_home = (env("T3CODE_HOME").map(PathBuf::from)).or(file.t3_home).unwrap_or_else(|| home.join(".t3"));
         let state_dir = dirs.state_dir().unwrap_or_else(|| dirs.data_local_dir()).to_path_buf();
-        let credentials = dirs.config_dir().join("credentials.json");
         let token = match env("SEIREI_T3_TOKEN").or(file.t3_token) {
             Some(token) => Some(Token { secret: Secret(token), access: None }),
-            None => saved_token(&credentials, &t3_home)?,
+            None => saved_token(&credentials(&dir, &MachineId::local()), &t3_home)?,
         };
-        Ok(Self { t3_home, state_dir, credentials, token, coordinator_model })
+        let local = MachineConfig { id: MachineId::local(), t3_home, token, coordinator_model };
+        Ok(Self { dir, state_dir, machines: vec![local] })
     }
+
+    pub fn machine(&self, id: &MachineId) -> anyhow::Result<&MachineConfig> {
+        (self.machines.iter().find(|machine| &machine.id == id)).with_context(|| format!("no machine is named {id}"))
+    }
+
+    pub fn credentials(&self, machine: &MachineId) -> PathBuf {
+        credentials(&self.dir, machine)
+    }
+}
+
+fn credentials(dir: &Path, machine: &MachineId) -> PathBuf {
+    dir.join("credentials").join(format!("{machine}.json"))
 }
 
 fn model_selection(raw: &str) -> anyhow::Result<ModelSelection> {

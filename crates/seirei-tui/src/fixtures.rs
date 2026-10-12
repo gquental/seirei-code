@@ -1,9 +1,9 @@
 use crate::app::{App, Event, Link};
 use seirei_proto::{
-    ids::{ModelId, ProjectId, ProviderInstanceId, SendId, T3Time, ThreadId},
+    ids::{MachineId, ModelId, ProjectId, ProviderInstanceId, SendId, T3Time, ThreadId},
     model::{
-        Choice, CoordinatorView, Health, Job, JobLink, Lineage, ModelSelection, PendingRequest, Project, ProjectView,
-        Question, RuntimeMode, ThreadStatus, ThreadSummary,
+        Choice, CoordinatorView, Health, Job, JobLink, Lineage, Machine, MachineProjects, MachineStatus,
+        ModelSelection, PendingRequest, Project, ProjectView, Question, RuntimeMode, ThreadStatus, ThreadSummary,
     },
     timeline::{Item, Timeline},
     wire::{BuildId, CallId, Reply, ServerMsg},
@@ -14,6 +14,16 @@ pub const COORDINATOR: &str = "mcp:coord";
 
 pub fn project_meta(id: &str, title: &str) -> Project {
     Project { id: ProjectId::new(id), title: title.into(), root: format!("/src/{title}").into(), default_model: None }
+}
+
+pub fn machine(name: &str, status: MachineStatus, projects: Vec<Project>) -> MachineProjects {
+    let id = MachineId::parse(name).expect("a machine name");
+    let address = format!("https://{name}.tail123b88.ts.net");
+    MachineProjects { machine: Machine { id, address, label: None, status }, projects }
+}
+
+pub fn local(projects: Vec<Project>) -> Vec<MachineProjects> {
+    vec![machine("local", MachineStatus::Connected, projects)]
 }
 
 pub fn model(provider: &str, model: &str) -> ModelSelection {
@@ -42,6 +52,7 @@ pub fn job(id: &str, title: &str) -> Job {
 
 pub fn view(coordinator: CoordinatorView, jobs: Vec<Job>, questions: Vec<PendingRequest>) -> ProjectView {
     ProjectView {
+        machine: MachineId::local(),
         project: project_meta("p", "seirei-code"),
         coordinator,
         jobs,
@@ -80,7 +91,7 @@ pub fn new_app(open: Option<&str>) -> App {
 pub fn app_in_project(view: ProjectView) -> App {
     let mut app = new_app(None);
     app.update(Event::Server(ServerMsg::Welcome));
-    let projects = vec![view.project.clone()];
+    let projects = local(vec![view.project.clone()]);
     app.update(Event::Server(ServerMsg::Reply { id: CallId(1), result: Ok(Reply::Projects(projects)) }));
     app.update(Event::Key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter)));
     app.update(Event::Server(ServerMsg::Project(Arc::new(view))));

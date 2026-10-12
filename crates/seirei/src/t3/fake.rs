@@ -23,6 +23,7 @@ pub struct FakeT3 {
 pub struct State {
     pub project: Project,
     pub access: Option<Access>,
+    pub down: Option<Down>,
     pub models: Vec<ModelSelection>,
     pub threads: Vec<ThreadSummary>,
     pub items: HashMap<ThreadId, Vec<Item>>,
@@ -45,6 +46,7 @@ impl FakeT3 {
         let state = State {
             project,
             access: None,
+            down: None,
             models: vec![opus()],
             threads: Vec::new(),
             items: HashMap::new(),
@@ -66,6 +68,14 @@ impl FakeT3 {
     pub fn with<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
         change(&mut self.state.lock().expect("no test panics while holding the fake"))
     }
+}
+
+/// Why `projects` fails.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Down {
+    Refused,
+    LoggedOut,
+    Silent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,8 +158,17 @@ impl T3Api for FakeT3 {
         self.with(|state| state.access)
     }
 
+    fn address(&self) -> String {
+        "http://fake.test".into()
+    }
+
     async fn projects(&self) -> Result<Vec<Project>, T3Error> {
-        Ok(self.with(|state| vec![state.project.clone()]))
+        match self.with(|state| state.down) {
+            None => Ok(self.with(|state| vec![state.project.clone()])),
+            Some(Down::Refused) => Err(T3Error::NoSession(Box::new(T3Error::Unreachable("connection refused".into())))),
+            Some(Down::LoggedOut) => Err(T3Error::NoSession(Box::new(T3Error::Unauthorized))),
+            Some(Down::Silent) => std::future::pending().await,
+        }
     }
 
     async fn models(&self) -> Result<Vec<ModelSelection>, T3Error> {
