@@ -1,0 +1,143 @@
+# Seirei architecture
+
+Seirei is a terminal front end over T3 Code's orchestration. Each project gets one pane. The pane shows a coordinator conversation and the implementation jobs the coordinator spawned, with live status. The coordinator and every job are ordinary T3 threads. Seirei runs no agents itself.
+
+A background daemon owns the connection to T3 and the synced state. TUI clients attach and detach over a Unix socket. Both ship in one binary, `seirei`.
+
+## Using it
+
+```
+$ seirei login               # once: pair with T3, save a 30-day credential
+$ seirei                     # attach (starting the daemon if needed) and open the project picker
+$ seirei seirei-code         # straight to one project's pane
+$ seirei status seirei-code  # the same pane as JSON, for scripts and debugging
+$ seirei daemon              # the daemon in the foreground
+$ seirei daemon --stop
+```
+
+In a project pane, `c` creates the coordinator when the project has none. `i` opens the composer, and `Enter` sends to the coordinator. `Tab` moves to the jobs list, `Enter` opens a job's timeline, and `Esc` returns. `a` answers the oldest open question.
+
+## What T3 gives us
+
+Seirei talks to T3's MCP server over streamable HTTP. The origin comes from `<T3CODE_HOME or ~/.t3>/userdata/server-runtime.json`. A few behaviors of that server shape everything below. They were read out of the running server's source, not guessed.
+
+- **T3 pushes nothing.** The server has tools only. No resources, no subscriptions. Seirei polls and diffs.
+- **`t3_thread_list` is ordered by `updatedAt`, newest first, and every timeline event bumps `updatedAt`.** One page per tick shows everything that changed since the last tick, even in a project with 1,900 threads.
+- **Timeline positions are not stable.** T3 recomputes them on every read. Rows get inserted before existing ones, rolled-back rows vanish, and finished items can reopen.
+- **Titles set at launch are never regenerated,** so a tag in a title is a permanent handle.
+- **A token from `t3 auth session issue` is capped at `approval-required`.** It cannot message or answer a thread running with more autonomy. The pairing-code OAuth flow can grant up to `full-access`, which is why `seirei login` exists.
+- **Tool approvals are invisible to MCP.** The pending-request tools return user-input questions only. A thread waiting on an approval has to be approved in T3's UI.
+
+## Crates
+
+| Crate | Owns | Why it is its own crate |
+| --- | --- | --- |
+| `seirei-proto` | Domain types, the timeline window, socket frames, the socket path | The only code both sides share. No tokio, no reqwest, no ratatui. |
+| `seirei-tui` | The app state machine, keymap, render, terminal and socket runtime | `seirei` depends on it, so it cannot depend on `seirei`. T3's wire format is unreachable from terminal code. |
+| `seirei` | The daemon (T3 boundary, project actors, server), `login`, and the CLI | The daemon has one consumer, the binary. A separate crate would hide nothing. |
+
+Module map:
+
+- `seirei_proto::ids` holds opaque T3 ids, `SendId`, and `T3Time`.
+- `seirei_proto::model` holds projects, thread summaries, lineage, jobs, the coordinator view, questions, and health.
+- `seirei_proto::timeline` holds timeline items, the open-set `ItemKind`, and the window.
+- `seirei_proto::wire` holds the socket protocol.
+- `seirei::config` decides where configuration and credentials come from.
+- `seirei::t3` is the `T3Api` seam, page sizes, positions, and the error taxonomy. `t3::mcp` speaks MCP over HTTP. `t3::wire` turns T3's JSON into domain types. `t3::login` runs the pairing flow.
+- `seirei::coordinator` decides attribution, the coordinator key and tags, the brief, and the ensure state machine.
+- `seirei::project` is one actor per project. It owns the scan, timeline refresh, commands, and publishing.
+- `seirei::server` owns sessions, the handshake, routing, and the actor registry.
+- `seirei_tui::app` is the TUI state machine, `keymap` every binding, and `render` the drawing.
+
+## The daemon's state
+
+Each watched project has one actor task, the only writer of that project's state and durable record. Sync ticks and user commands for a project run on that task. So "ensure coordinator" cannot race the scan that would adopt the coordinator it is creating. There is no lock around project state. The only shared structure is the registry that maps a project id to its actor, guarded for get-or-spawn.
+
+Actors publish through `watch` channels. Each project has one `Arc<ProjectView>`, and each open timeline has one `Arc<Timeline>`. A slow reader skips to the latest value. Interest is channel liveness. A timeline stays hot exactly as long as some session holds its receiver, and the view's receiver count picks the polling cadence.
+
+The only durable state is `<state_dir>/projects/<project>.json`, holding the coordinator binding. Everything else is rebuilt from T3 after a restart.
+
+## The protocol
+
+- **Framing.** One JSON object per line over a Unix socket at `$SEIREI_SOCKET`, else `$XDG_RUNTIME_DIR/seirei/daemon.sock`. You can debug it with `socat`.
+- **Versioning.** The TUI and daemon are one executable, so the protocol needs build detection, not compatibility rules. `Hello`, `Welcome`, `WrongBuild`, and `Yielding` are frozen. Every other shape may change in any build. A TUI that finds an older daemon offers to restart it.
+- **What crosses.** Whole domain values. `Project(ProjectView)` carries the pane, and `Timeline` carries one thread's window. Nothing is a delta, a sequence number, or a view model.
+- **Convergence.** `Subscribe { project, job }` is declarative and replaces the last one. A reconnecting client sends `Hello` and its current subscription, and its first frames are the full current values.
+
+## Sync
+
+Each tick of a project's actor runs these steps:
+
+1. Drop timelines nobody holds.
+2. **Scan.** Page `t3_thread_list` until a page reaches back past the horizon. Pages overlap by five rows, because a thread archived mid-scan shifts later rows up. Every row lands in a map, newest `updatedAt` wins. The horizon starts at the binding's `minted_after` and then tracks the newest `updatedAt` seen. A thread bumped mid-scan jumps above the horizon and is caught next tick.
+3. **Refresh timelines.** Refresh each hot timeline whose list row shows a new `updatedAt`. A refresh reads the newest 100 items and replaces the window whole. Positions shift, so nothing is merged. A second read happens only when the thread grew between the list call and the read.
+4. **Questions.** For `Waiting` threads, list pending question ids and read the new ones.
+5. Publish if the view changed.
+
+The cadence is 1.5 s while a client watches the project and 20 s otherwise. Each consecutive failure doubles it, up to 60 s. Any user command triggers an immediate tick.
+
+A tick that fails halfway leaves correct, partly stale state. Every step is an upsert or a whole-value replace, and the next tick redoes it. Writes are classified by `T3Error::may_have_applied`. A `Send` carries the client's `SendId` as T3's `clientRequestId`, so resending cannot duplicate. A coordinator launch whose response was lost is found by its tag before any relaunch.
+
+## The coordinator and its jobs
+
+The coordinator key is the single durable fact per project. `Binding { key, minted_after, thread }` is written atomically before anything is launched under the key.
+
+- The coordinator's title carries `seirei:<KEY>`.
+- The brief tells the coordinator to launch each job with `t3_thread_launch` into its own worktree, with a title ending in `[job:<KEY>]`.
+- A job is a direct `delegate_task` child of the coordinator, or a top-level MCP-created thread whose title carries the job tag. Anything descended from a job through subagent links is that job's subtask.
+
+`coordinator::jobs` derives roles from the scanned rows on every publish. It is a pure function, and roles are never stored. Rows arrive newest first, so a child is often seen before its parent.
+
+`ensure_step` is the whole lifecycle:
+
+| Binding | Looked up since last launch | Step |
+| --- | --- | --- |
+| none | (any) | `Mint`: persist a fresh key |
+| key, no thread | no | `Lookup`: `t3_thread_list { titleContains: seirei:<KEY> }`, adopt the oldest match |
+| key, no thread | yes | `Launch`, then persist the thread id |
+| key, thread | (any) | `Ready` |
+
+"Looked up" lives in memory, so a restarted daemon always looks before it launches. A crash between `t3_thread_launch` and recording its result resolves on the next tick. The lookup finds the tagged thread and binds it.
+
+The coordinator launches at the credential's ceiling. A coordinator above the ceiling would be read-only to seirei.
+
+## The TUI
+
+`App::update(Event) -> Vec<Effect>` is pure. It does no IO and reads no terminal or clock. `Screen` is `Picker` or `Project`. Inside a project, `Focus` (`Conversation`, `Jobs`, `Job(id)`) and `Mode` (`Browse`, `Compose`, `ConfirmCreate`, `Answer`) are separate enums, so modes exclude each other by construction. The keymap context is derived, never stored. The subscription is derived from the screen and resent whenever it changes or the link comes back.
+
+The keymap is one table of `(context, key, action, help)`. Dispatch, the help overlay, and the footer all read it. Tests fail the build when a key is bound twice in one context, or when the composer would swallow a bound printable key. A binding shows in the footer only when its action can do something now. "Message the coordinator" needs a coordinator.
+
+A draft's `SendId` changes only after the daemon confirms the send. Losing the daemon mid-send turns the draft into a resendable failure, and resending cannot duplicate.
+
+## Synthesis decision
+
+Three designs were built in parallel, each with a compiling sketch. A pushed daemon-rendered view models with keyed patches. B replicated domain state through a sequenced change log and a shared reducer. C used per-project actors with whole-value frames. A cross-judge scored them C 25, B 24, A 23 of 30, and picked C on the smallest surface and invariants enforced by structure.
+
+C is the base. These parts came from elsewhere or replaced C's:
+
+- **Timeline window replace,** replacing C's position-keyed merge. All three candidates merged by position. Running their own merge code against a row inserted mid-thread showed duplicated rows and a missing row. C's version also stalled behind a long-running item.
+- **Title tags, from A and B,** replacing C's first-message marker and its durable verdict cache. C rejected title tags because titles might be regenerated, and T3's source shows they never are. Classification became a pure function of list rows.
+- **Subtask rollup, from A.** C attributed only the coordinator's direct children, so a launched job's own helpers disappeared.
+- **The "may have applied" error taxonomy, from B.** C's errors could not tell "never reached T3" from "response lost".
+- **Choices keep `value`, from A,** because T3 expects `value ?? label` in answers.
+- **Scan overlap, from B,** because offset cursors shift mid-scan.
+- **`seirei status`, from B's headless clients,** as the lever for verifying the daemon without a terminal.
+- **`seirei login`, new.** All three designs minted tokens with `t3 auth session issue`, which caps seirei at `approval-required` and is rejected outright without `--subject mcp-client`.
+
+Rejected: A's patch protocol and B's replica machinery (sequence numbers, epochs, digests, a source-hash fingerprint). Whole values on a local socket make both dead weight. Also rejected were B's separate T3 crate, which has one consumer, and B's strict enums that fail a whole page on one unknown value. C parses per record instead.
+
+## Tradeoffs accepted
+
+- We resend a whole timeline window on every change, in exchange for no client reducer and no resync path.
+- We restart the daemon on every upgrade, one keypress, in exchange for zero protocol compatibility code.
+- We accept about 1.5 s of latency while a project is watched, because T3 offers no push.
+- A job launched without the tag is invisible. In exchange, attribution never parses T3's tool-call blobs.
+- Sync logic lives in async actor methods rather than a pure reducer. Its tests need a fake `T3Api`. In exchange, the code reads top to bottom.
+- `seirei login` lasts 30 days and T3 has no refresh grant. Seirei says so when the token lapses, and the user pairs again.
+- An archived job keeps its last status in the pane until the daemon restarts. Nothing removes rows the scan stops seeing.
+
+## Open questions
+
+- Should attribution also read the coordinator's `t3_thread_launch` tool calls? T3 includes the tool output in `dynamic_tool` items, so a job the coordinator forgot to tag could still be found. The output's exact JSON needs a real coordinator transcript first.
+- What ceiling should `seirei login` request by default? It requests `full-access` because a coordinator usually runs without approval prompts.
+- Should the coordinator brief be user-editable, for example a file in the config directory?
