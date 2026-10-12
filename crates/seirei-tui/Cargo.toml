@@ -1,0 +1,13 @@
+[package]
+name = "seirei-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+seirei-proto.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+unicode-width = "0.2"
