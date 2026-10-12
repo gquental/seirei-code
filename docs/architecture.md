@@ -70,7 +70,7 @@ The only durable state is `<state_dir>/projects/<project>.json`, holding the coo
 Each tick of a project's actor runs these steps:
 
 1. Drop timelines nobody holds.
-2. **Recover.** When the key has no thread and no lookup has run since the last launch attempt, look up the key's tag and adopt the thread it finds. A tick never launches.
+2. **Adopt a lost launch.** When the key has no thread and no lookup has run since the last launch attempt, look up the key's tag and adopt the thread it finds. A tick never launches.
 3. **Scan,** once a coordinator is bound. Page `t3_thread_list` until a page reaches back past the horizon. Pages overlap by five rows, because a thread archived mid-scan shifts later rows up. Every row lands in a map, newest `updatedAt` wins. The horizon starts at the binding's `minted_after` and then tracks the newest `updatedAt` seen. A thread bumped mid-scan jumps above the horizon and is caught next tick.
 4. **Refresh timelines.** Refresh each hot timeline whose list row shows a new `updatedAt`. A refresh reads the newest 100 items and replaces the window whole. Positions shift, so nothing is merged. A second read happens only when the thread grew between the list call and the read.
 5. **Questions.** For `Waiting` threads, list pending question ids and read the new ones.
