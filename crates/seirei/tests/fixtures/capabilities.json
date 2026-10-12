@@ -1,0 +1,188 @@
+{
+  "parentThreadId": null,
+  "inheritedProviderInstanceId": null,
+  "inheritedModel": null,
+  "runtimeMode": "approval-required",
+  "interactionMode": "default",
+  "providers": [
+    {
+      "providerInstanceId": "codex",
+      "driverKind": "codex",
+      "displayName": "Codex",
+      "models": [
+        {
+          "id": "gpt-6.1-sol",
+          "label": "GPT-6.1-Sol",
+          "options": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low",
+                  "isDefault": true
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                },
+                {
+                  "id": "max",
+                  "label": "Max"
+                },
+                {
+                  "id": "ultra",
+                  "label": "Ultra"
+                }
+              ],
+              "currentValue": "low"
+            },
+            {
+              "id": "serviceTier",
+              "label": "Service Tier",
+              "type": "select",
+              "options": [
+                {
+                  "id": "default",
+                  "label": "Standard",
+                  "isDefault": true
+                },
+                {
+                  "id": "priority",
+                  "label": "Fast",
+                  "description": "2x speed, increased usage"
+                },
+                {
+                  "id": "ultrafast",
+                  "label": "Ultrafast",
+                  "description": "Even faster, more expensive"
+                }
+              ],
+              "currentValue": "default"
+            }
+          ]
+        },
+        {
+          "id": "gpt-6-astra",
+          "label": "GPT-6-Astra"
+        }
+      ],
+      "canRunChildTask": true,
+      "canRunCrossProviderChildTask": true,
+      "constraints": []
+    },
+    {
+      "providerInstanceId": "claudeAgent",
+      "driverKind": "claudeAgent",
+      "displayName": "Claude",
+      "models": [
+        {
+          "id": "claude-opus-5-5",
+          "label": "Claude Opus 5.5",
+          "options": [
+            {
+              "id": "effort",
+              "label": "Reasoning",
+              "type": "select",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium",
+                  "isDefault": true
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                },
+                {
+                  "id": "max",
+                  "label": "Max"
+                },
+                {
+                  "id": "ultracode",
+                  "label": "Ultracode",
+                  "description": "xhigh effort plus multi-agent workflow orchestration"
+                },
+                {
+                  "id": "ultrathink",
+                  "label": "Ultrathink"
+                }
+              ],
+              "promptInjectedValues": [
+                "ultrathink"
+              ]
+            },
+            {
+              "id": "fastMode",
+              "label": "Fast Mode",
+              "type": "boolean"
+            }
+          ]
+        }
+      ],
+      "canRunChildTask": true,
+      "canRunCrossProviderChildTask": true,
+      "constraints": []
+    },
+    {
+      "providerInstanceId": "cursor",
+      "driverKind": "cursor",
+      "displayName": "Cursor",
+      "models": [],
+      "canRunChildTask": false,
+      "canRunCrossProviderChildTask": false,
+      "constraints": [
+        "Provider instance is disabled.",
+        "Provider executable is not installed.",
+        "Cursor is disabled in T3 Code settings."
+      ]
+    },
+    {
+      "providerInstanceId": "pi",
+      "driverKind": "pi",
+      "displayName": "Pi",
+      "models": [
+        {
+          "id": "default",
+          "label": "Pi default",
+          "options": []
+        }
+      ],
+      "canRunChildTask": false,
+      "canRunCrossProviderChildTask": false,
+      "constraints": [
+        "Provider instance is disabled.",
+        "Provider executable is not installed.",
+        "Pi is disabled in T3 Code settings."
+      ]
+    }
+  ],
+  "features": {
+    "appOwnedSubagents": true,
+    "asyncPolling": true,
+    "cancellation": true,
+    "batchThreadCreation": true,
+    "threadManagement": true,
+    "incrementalThreadRead": true,
+    "scheduledTasks": true,
+    "maxBatchThreads": 20
+  }
+}

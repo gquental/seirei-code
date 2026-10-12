@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/seirei-proto", "crates/seirei-tui"]
+members = ["crates/seirei-proto", "crates/seirei-tui", "crates/seirei"]
 
 [workspace.package]
 version = "0.1.0"
