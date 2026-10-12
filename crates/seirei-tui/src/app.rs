@@ -1,10 +1,10 @@
 use crate::keymap::{self, Action, Context};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use seirei_proto::{
-    ids::{ProjectRef, RequestId, SendId, ThreadId},
+    ids::{MachineId, ProjectRef, RequestId, SendId, ThreadId},
     model::{
-        self, Access, Answer, Answers, CoordinatorView, Job, Machine, MachineProjects, PendingRequest, Project,
-        ProjectView, Question, RuntimeMode, ThreadSummary,
+        self, Access, Answer, Answers, CoordinatorView, Job, Machine, MachineProjects, MachineStatus, PendingRequest,
+        Project, ProjectView, Question, RuntimeMode, ThreadSummary,
     },
     timeline::Timeline,
     wire::{BuildId, CallError, CallId, ClientMsg, Command, Reply, ServerMsg, Subscription},
@@ -55,15 +55,69 @@ pub struct App {
 }
 
 enum Purpose {
-    ListProjects,
+    /// `select` puts the picker's cursor on that machine's heading once the list arrives.
+    ListProjects {
+        select: Option<MachineId>,
+    },
     Send,
     EnsureCoordinator,
     Answer,
+    ChangeMachine {
+        select: Option<MachineId>,
+    },
 }
 
 pub enum Screen {
-    Picker { cursor: usize },
+    /// `cursor` counts machine headings and projects alike.
+    Picker {
+        cursor: usize,
+        form: Option<MachineForm>,
+    },
     Project(Box<ProjectScreen>),
+}
+
+/// One line of the picker the cursor can rest on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PickerRow<'a> {
+    Machine(&'a Machine),
+    Project(&'a Machine, &'a Project),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MachineForm {
+    pub kind: FormKind,
+    pub state: FormState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FormKind {
+    Add {
+        name: String,
+        address: String,
+        field: Field,
+    },
+    /// `code` is `None` for `local`, whose pairing code the daemon makes.
+    Login {
+        machine: MachineId,
+        code: Option<String>,
+        access: Access,
+    },
+    Remove {
+        machine: MachineId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    Name,
+    Address,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FormState {
+    Editing,
+    Working(CallId),
+    Failed(String),
 }
 
 pub struct ProjectScreen {
@@ -144,7 +198,7 @@ impl App {
     pub fn new(open: Option<String>, build: BuildId, send_seed: SendId) -> Self {
         Self {
             link: Link::Connecting,
-            screen: Screen::Picker { cursor: 0 },
+            screen: Screen::Picker { cursor: 0, form: None },
             projects: vec![],
             help: false,
             notice: None,
@@ -160,6 +214,19 @@ impl App {
     /// Every project the picker offers, machine by machine.
     pub fn listed(&self) -> impl Iterator<Item = (&Machine, &Project)> {
         listed(&self.projects)
+    }
+
+    /// Each machine's heading followed by its projects.
+    pub fn rows(&self) -> impl Iterator<Item = PickerRow<'_>> {
+        self.projects.iter().flat_map(|listed| {
+            let projects = listed.projects.iter().map(|project| PickerRow::Project(&listed.machine, project));
+            std::iter::once(PickerRow::Machine(&listed.machine)).chain(projects)
+        })
+    }
+
+    pub fn row(&self) -> Option<PickerRow<'_>> {
+        let Screen::Picker { cursor, .. } = &self.screen else { return None };
+        self.rows().nth(*cursor)
     }
 
     pub fn subscription(&self) -> Subscription {
@@ -181,7 +248,12 @@ impl App {
 
     pub fn screen_context(&self) -> Context {
         match &self.screen {
-            Screen::Picker { .. } => Context::Picker,
+            Screen::Picker { form: None, .. } => Context::Picker,
+            Screen::Picker { form: Some(form), .. } => match form.kind {
+                FormKind::Add { .. } => Context::AddMachine,
+                FormKind::Login { .. } => Context::Login,
+                FormKind::Remove { .. } => Context::ConfirmRemove,
+            },
             Screen::Project(p) => match &p.mode {
                 Mode::Browse => Context::Browse,
                 Mode::Compose => Context::Compose,
@@ -196,10 +268,20 @@ impl App {
         match (self.context(), action) {
             (_, Action::Quit | Action::ToggleHelp) => true,
             (Context::WrongBuild, Action::TakeOver) => !self.take_over,
-            (Context::Picker, Action::Up | Action::Down | Action::Open) => self.listed().next().is_some(),
+            (Context::Picker, Action::Up | Action::Down) => self.rows().next().is_some(),
+            (Context::Picker, Action::Open) => matches!(self.row(), Some(PickerRow::Project(..))),
+            (Context::Picker, Action::AddMachine) => true,
+            (Context::Picker, Action::LogIn) => matches!(
+                self.row(),
+                Some(PickerRow::Machine(machine)) if !matches!(machine.status, MachineStatus::Duplicate { .. })
+            ),
+            (Context::Picker, Action::RemoveMachine) => {
+                matches!(self.row(), Some(PickerRow::Machine(machine)) if !machine.id.is_local())
+            }
             (context, action) => match &self.screen {
                 Screen::Project(p) => p.live(context, action, self.link == Link::Up),
-                Screen::Picker { .. } => false,
+                Screen::Picker { form: Some(form), .. } => form.live(action, self.link == Link::Up),
+                Screen::Picker { form: None, .. } => false,
             },
         }
     }
@@ -246,7 +328,7 @@ impl App {
             ServerMsg::Welcome => {
                 self.link = Link::Up;
                 self.take_over = false;
-                vec![self.call(Purpose::ListProjects, Command::ListProjects)]
+                vec![self.call(Purpose::ListProjects { select: None }, Command::ListProjects)]
             }
             ServerMsg::WrongBuild { daemon } => {
                 self.link = Link::WrongBuild(daemon);
@@ -280,15 +362,43 @@ impl App {
     fn resolve(&mut self, id: CallId, result: Result<Reply, CallError>) -> Vec<Effect> {
         let Some(purpose) = self.calls.remove(&id) else { return vec![] };
         match (purpose, result) {
-            (Purpose::ListProjects, Ok(Reply::Projects(projects))) => {
+            (Purpose::ListProjects { select }, Ok(Reply::Projects(projects))) => {
+                let first = self.projects.is_empty();
                 self.projects = projects;
-                let listed = self.listed().count();
-                if let Screen::Picker { cursor } = &mut self.screen {
-                    *cursor = (*cursor).min(listed.saturating_sub(1));
+                let at = if first {
+                    self.rows().position(|row| matches!(row, PickerRow::Project(..)))
+                } else {
+                    self.rows().position(|row| matches!(row, PickerRow::Machine(m) if Some(&m.id) == select.as_ref()))
+                };
+                let last = self.rows().count().saturating_sub(1);
+                if let Screen::Picker { cursor, .. } = &mut self.screen {
+                    *cursor = at.unwrap_or(*cursor).min(last);
                 }
                 self.open_named()
             }
-            (Purpose::ListProjects, Err(e)) => self.notice = Some(format!("Could not list projects: {}", e.message)),
+            (Purpose::ListProjects { .. }, Err(e)) => {
+                self.notice = Some(format!("Could not list projects: {}", e.message))
+            }
+            (Purpose::ChangeMachine { select }, result) => {
+                let waiting = match &mut self.screen {
+                    Screen::Picker { form, .. } if form.as_ref().is_some_and(|f| f.state == FormState::Working(id)) => {
+                        Some(form)
+                    }
+                    _ => None,
+                };
+                match result {
+                    Ok(_) => {
+                        if let Some(form) = waiting {
+                            *form = None;
+                        }
+                        return vec![self.call(Purpose::ListProjects { select }, Command::ListProjects)];
+                    }
+                    Err(e) => match waiting.and_then(Option::as_mut) {
+                        Some(form) => form.state = FormState::Failed(e.message),
+                        None => self.notice = Some(e.message),
+                    },
+                }
+            }
             (Purpose::Send, result) => {
                 if let Screen::Project(p) = &mut self.screen
                     && p.draft.state == DraftState::Sending(id)
@@ -308,7 +418,7 @@ impl App {
                 self.notice =
                     Some(format!("{} The answer may have been recorded; check T3 before retrying.", e.message))
             }
-            (Purpose::ListProjects | Purpose::EnsureCoordinator, _) => {}
+            (Purpose::ListProjects { .. } | Purpose::EnsureCoordinator, _) => {}
         }
         vec![]
     }
@@ -338,23 +448,10 @@ impl App {
                 vec![Effect::Reconnect]
             }
             (Context::Picker, action) => {
-                let Screen::Picker { cursor } = &mut self.screen else { return vec![] };
-                match action {
-                    Action::Up => *cursor = cursor.saturating_sub(1),
-                    Action::Down => *cursor = (*cursor + 1).min(listed(&self.projects).count().saturating_sub(1)),
-                    _ => {
-                        let index = *cursor;
-                        let picked = self.listed().nth(index).map(|(machine, project)| ProjectRef {
-                            machine: machine.id.clone(),
-                            project: project.id.clone(),
-                        });
-                        if let Some(at) = picked {
-                            self.enter(at);
-                        }
-                    }
-                }
+                self.browse_picker(action);
                 vec![]
             }
+            (Context::AddMachine | Context::Login | Context::ConfirmRemove, action) => self.fill_form(action),
             (Context::Compose, Action::Submit) => self.submit_draft(),
             (Context::Answer | Context::AnswerText, Action::Submit) => self.submit_answer(),
             (Context::Confirm, Action::Confirm) => {
@@ -369,16 +466,85 @@ impl App {
                     p.set_focus(Focus::Jobs);
                     return vec![];
                 }
-                let cursor = listed(&self.projects)
-                    .position(|(machine, project)| machine.id == p.id.machine && project.id == p.id.project)
-                    .unwrap_or(0);
-                self.screen = Screen::Picker { cursor };
-                vec![self.call(Purpose::ListProjects, Command::ListProjects)]
+                let at = p.id.clone();
+                let here = |row: PickerRow| matches!(row, PickerRow::Project(m, project) if m.id == at.machine && project.id == at.project);
+                let cursor = self.rows().position(here).unwrap_or(0);
+                self.screen = Screen::Picker { cursor, form: None };
+                vec![self.call(Purpose::ListProjects { select: None }, Command::ListProjects)]
             }
             (context, action) => {
                 if let Screen::Project(p) = &mut self.screen {
                     p.act(context, action);
                 }
+                vec![]
+            }
+        }
+    }
+
+    fn browse_picker(&mut self, action: Action) {
+        let (heading, project) = match self.row() {
+            Some(PickerRow::Machine(machine)) => (Some(machine.id.clone()), None),
+            Some(PickerRow::Project(machine, project)) => {
+                (None, Some(ProjectRef { machine: machine.id.clone(), project: project.id.clone() }))
+            }
+            None => (None, None),
+        };
+        let last = self.rows().count().saturating_sub(1);
+        let Screen::Picker { cursor, form } = &mut self.screen else { return };
+        let kind = match (action, heading) {
+            (Action::Up, _) => {
+                *cursor = cursor.saturating_sub(1);
+                return;
+            }
+            (Action::Down, _) => {
+                *cursor = (*cursor + 1).min(last);
+                return;
+            }
+            (Action::Open, _) => {
+                if let Some(at) = project {
+                    self.enter(at);
+                }
+                return;
+            }
+            (Action::AddMachine, _) => {
+                FormKind::Add { name: String::new(), address: String::new(), field: Field::Name }
+            }
+            (Action::LogIn, Some(machine)) => {
+                let code = (!machine.is_local()).then(String::new);
+                FormKind::Login { machine, code, access: Access::FullAccess }
+            }
+            (Action::RemoveMachine, Some(machine)) => FormKind::Remove { machine },
+            _ => return,
+        };
+        *form = Some(MachineForm { kind, state: FormState::Editing });
+    }
+
+    fn fill_form(&mut self, action: Action) -> Vec<Effect> {
+        let Screen::Picker { form: slot, .. } = &mut self.screen else { return vec![] };
+        let Some(form) = slot.as_mut() else { return vec![] };
+        match (&mut form.kind, action) {
+            (FormKind::Add { field, .. }, Action::NextField) => {
+                *field = if *field == Field::Name { Field::Address } else { Field::Name }
+            }
+            (FormKind::Login { access, .. }, Action::Left | Action::Right) => *access = step(*access, action),
+            (_, Action::Submit | Action::Confirm) => return self.submit_form(),
+            (_, Action::Back) => *slot = None,
+            _ => {}
+        }
+        vec![]
+    }
+
+    fn submit_form(&mut self) -> Vec<Effect> {
+        let id = self.next_call_id();
+        let Screen::Picker { form: Some(form), .. } = &mut self.screen else { return vec![] };
+        match form.command() {
+            Ok((command, select)) => {
+                form.state = FormState::Working(id);
+                self.calls.insert(id, Purpose::ChangeMachine { select });
+                vec![Effect::Send(ClientMsg::Call { id, command })]
+            }
+            Err(why) => {
+                form.state = FormState::Failed(why);
                 vec![]
             }
         }
@@ -448,15 +614,21 @@ impl App {
             KeyCode::Backspace => None,
             _ => return,
         };
-        let Screen::Project(p) = &mut self.screen else { return };
-        let text = match &mut p.mode {
-            Mode::Compose if matches!(p.draft.state, DraftState::Sending(_)) => return,
-            Mode::Compose => {
-                p.draft.state = DraftState::Editing;
-                &mut p.draft.text
-            }
-            Mode::Answer(form) => &mut form.custom,
-            Mode::Browse | Mode::ConfirmCreate => return,
+        let text = match &mut self.screen {
+            Screen::Picker { form: Some(form), .. } => match form.field() {
+                Some(text) => text,
+                None => return,
+            },
+            Screen::Picker { form: None, .. } => return,
+            Screen::Project(p) => match &mut p.mode {
+                Mode::Compose if matches!(p.draft.state, DraftState::Sending(_)) => return,
+                Mode::Compose => {
+                    p.draft.state = DraftState::Editing;
+                    &mut p.draft.text
+                }
+                Mode::Answer(form) => &mut form.custom,
+                Mode::Browse | Mode::ConfirmCreate => return,
+            },
         };
         match typed {
             Some(c) => text.push(c),
@@ -474,6 +646,60 @@ impl App {
         self.next_call += 1;
         CallId(self.next_call)
     }
+}
+
+impl MachineForm {
+    fn live(&self, action: Action, up: bool) -> bool {
+        let idle = !matches!(self.state, FormState::Working(_));
+        match (&self.kind, action) {
+            (_, Action::Back) => true,
+            (FormKind::Add { .. }, Action::NextField) => true,
+            (FormKind::Add { name, address, .. }, Action::Submit) => {
+                up && idle && !name.trim().is_empty() && !address.trim().is_empty()
+            }
+            (FormKind::Login { access, .. }, Action::Left | Action::Right) => idle && step(*access, action) != *access,
+            (FormKind::Login { code, .. }, Action::Submit) => {
+                up && idle && code.as_deref().is_none_or(|code| !code.trim().is_empty())
+            }
+            (FormKind::Remove { .. }, Action::Confirm) => up && idle,
+            _ => false,
+        }
+    }
+
+    /// The field typing goes to, unless a call is in flight.
+    fn field(&mut self) -> Option<&mut String> {
+        if let FormState::Working(_) = self.state {
+            return None;
+        }
+        match &mut self.kind {
+            FormKind::Add { name, field: Field::Name, .. } => Some(name),
+            FormKind::Add { address, field: Field::Address, .. } => Some(address),
+            FormKind::Login { code, .. } => code.as_mut(),
+            FormKind::Remove { .. } => None,
+        }
+    }
+
+    /// The call this form makes, and the machine the picker selects once it succeeds.
+    fn command(&self) -> Result<(Command, Option<MachineId>), String> {
+        Ok(match &self.kind {
+            FormKind::Add { name, address, .. } => {
+                let name = MachineId::parse(name.trim())?;
+                (Command::AddMachine { name: name.clone(), address: address.clone() }, Some(name))
+            }
+            FormKind::Login { machine, code, access } => {
+                let code = code.as_ref().map(|code| code.trim().to_owned());
+                (Command::Login { machine: machine.clone(), access: *access, code }, Some(machine.clone()))
+            }
+            FormKind::Remove { machine } => (Command::RemoveMachine { machine: machine.clone() }, None),
+        })
+    }
+}
+
+/// One access level up or down, stopping at either end.
+fn step(access: Access, action: Action) -> Access {
+    let at = Access::ALL.iter().position(|level| *level == access).expect("ALL lists every level");
+    let to = if action == Action::Left { at.saturating_sub(1) } else { (at + 1).min(Access::ALL.len() - 1) };
+    Access::ALL[to]
 }
 
 impl Draft {
@@ -727,7 +953,7 @@ fn scroll(back: &mut usize, older: bool) {
 mod tests {
     use super::*;
     use crate::fixtures::*;
-    use crossterm::event::KeyCode::{Backspace, Char, Enter, Esc, Tab};
+    use crossterm::event::KeyCode::{Backspace, Char, Enter, Esc, Left, Tab};
     use seirei_proto::{
         ids::{MachineId, ProjectId},
         model::MachineStatus,
@@ -807,7 +1033,7 @@ mod tests {
         assert_eq!(project(&app).id, at("local", "b"));
 
         let effects = press(&mut app, Esc);
-        assert!(matches!(app.screen, Screen::Picker { cursor: 1 }));
+        assert!(matches!(app.screen, Screen::Picker { cursor: 2, .. }), "beta, under the local heading");
         let [(id, Command::ListProjects)] = calls(&effects)[..] else { panic!() };
         app.update(reply(id, Ok(Reply::Projects(local(vec![project_meta("a", "alpha"), project_meta("b", "beta")])))));
         assert!(matches!(app.screen, Screen::Picker { .. }));
@@ -1140,6 +1366,160 @@ mod tests {
         app.update(Event::Server(ServerMsg::Welcome));
         let hello = app.update(Event::Connected);
         assert!(matches!(hello.as_slice(), [Effect::Send(ClientMsg::Hello { take_over: false, .. })]));
+    }
+
+    fn id(name: &str) -> MachineId {
+        MachineId::parse(name).unwrap()
+    }
+
+    fn listing() -> Vec<MachineProjects> {
+        vec![
+            machine("local", MachineStatus::Connected, vec![project_meta("a", "alpha")]),
+            machine("studio", MachineStatus::NeedsLogin, vec![]),
+            machine("twin", MachineStatus::Duplicate { of: MachineId::local() }, vec![]),
+            machine("box", MachineStatus::Connected, vec![project_meta("c", "photos")]),
+        ]
+    }
+
+    fn picker(listing: Vec<MachineProjects>) -> App {
+        let mut app = new_app(None);
+        let effects = app.update(Event::Server(ServerMsg::Welcome));
+        let [(id, _)] = calls(&effects)[..] else { panic!("expected ListProjects") };
+        app.update(reply(id, Ok(Reply::Projects(listing))));
+        app
+    }
+
+    fn cursor(app: &App) -> String {
+        match app.row() {
+            Some(PickerRow::Machine(machine)) => format!("heading {}", machine.id),
+            Some(PickerRow::Project(_, project)) => project.title.clone(),
+            None => "nothing".into(),
+        }
+    }
+
+    fn form(app: &App) -> &MachineForm {
+        match &app.screen {
+            Screen::Picker { form: Some(form), .. } => form,
+            _ => panic!("expected a machine form"),
+        }
+    }
+
+    fn one_call(effects: &[Effect]) -> (CallId, Command) {
+        match calls(effects)[..] {
+            [(id, command)] => (id, command.clone()),
+            _ => panic!("expected one call, got {effects:?}"),
+        }
+    }
+
+    #[test]
+    fn the_cursor_visits_machine_headings_and_projects() {
+        let mut app = picker(listing());
+        let mut seen = vec![cursor(&app)];
+        for _ in 0..5 {
+            press(&mut app, Char('j'));
+            seen.push(cursor(&app));
+        }
+        assert_eq!(
+            seen,
+            ["alpha", "heading studio", "heading twin", "heading box", "photos", "photos"],
+            "the first listing starts on the first project, and the cursor stops at the last row"
+        );
+        for _ in 0..6 {
+            press(&mut app, Char('k'));
+        }
+        assert_eq!(cursor(&app), "heading local");
+        assert!(press(&mut app, Enter).is_empty(), "Enter on a heading does nothing");
+        assert_eq!(app.context(), Context::Picker);
+
+        let live = |app: &App| [Action::Open, Action::LogIn, Action::RemoveMachine].map(|action| app.live(action));
+        let mut seen = vec![(cursor(&app), live(&app))];
+        for _ in 0..3 {
+            press(&mut app, Char('j'));
+            seen.push((cursor(&app), live(&app)));
+        }
+        assert_eq!(
+            seen,
+            [
+                ("heading local".into(), [false, true, false]),
+                ("alpha".into(), [true, false, false]),
+                ("heading studio".into(), [false, true, true]),
+                ("heading twin".into(), [false, false, true]),
+            ],
+            "open a project; log in to any machine but a duplicate; remove any machine but local"
+        );
+    }
+
+    #[test]
+    fn each_machine_form_sends_its_command_and_a_success_refreshes_the_list() {
+        let mut app = picker(listing());
+        press(&mut app, Char('m'));
+        assert_eq!(app.context(), Context::AddMachine);
+        type_text(&mut app, "mini");
+        assert!(!app.live(Action::Submit), "an address is needed too");
+        press(&mut app, Tab);
+        type_text(&mut app, "https://mini.tail123b88.ts.net");
+        let (call, command) = one_call(&press(&mut app, Enter));
+        let address = "https://mini.tail123b88.ts.net".to_owned();
+        assert_eq!(command, Command::AddMachine { name: id("mini"), address });
+        assert!(matches!(form(&app).state, FormState::Working(_)), "the form shows it is working");
+        assert!(press(&mut app, Enter).is_empty(), "a second Enter waits for the first");
+
+        let (list, command) = one_call(&app.update(reply(call, Ok(Reply::Done))));
+        assert_eq!((app.context(), command), (Context::Picker, Command::ListProjects), "closed, and the list reloads");
+        let mut added = listing();
+        added.push(machine("mini", MachineStatus::NeedsLogin, vec![]));
+        app.update(reply(list, Ok(Reply::Projects(added))));
+        assert_eq!(cursor(&app), "heading mini", "the cursor waits on the new machine");
+
+        press(&mut app, Char('l'));
+        assert_eq!(app.context(), Context::Login);
+        type_text(&mut app, " ABC-123 ");
+        press(&mut app, Left);
+        let (_, command) = one_call(&press(&mut app, Enter));
+        let code = Some("ABC-123".to_owned());
+        assert_eq!(command, Command::Login { machine: id("mini"), access: Access::Auto, code });
+
+        let mut app = picker(listing());
+        press(&mut app, Char('k'));
+        press(&mut app, Char('l'));
+        assert!(app.live(Action::Submit), "local needs no code; the daemon makes one");
+        let (_, command) = one_call(&press(&mut app, Enter));
+        assert_eq!(command, Command::Login { machine: MachineId::local(), access: Access::FullAccess, code: None });
+
+        let mut app = picker(listing());
+        press(&mut app, Char('j'));
+        press(&mut app, Char('x'));
+        assert_eq!(app.context(), Context::ConfirmRemove);
+        let (call, command) = one_call(&press(&mut app, Char('y')));
+        assert_eq!(command, Command::RemoveMachine { machine: id("studio") });
+        let (_, command) = one_call(&app.update(reply(call, Ok(Reply::Done))));
+        assert_eq!((app.context(), command), (Context::Picker, Command::ListProjects));
+    }
+
+    #[test]
+    fn a_refused_machine_change_keeps_the_form_and_its_input() {
+        let mut app = picker(listing());
+        press(&mut app, Char('m'));
+        type_text(&mut app, "jkmxlq");
+        assert_eq!(app.context(), Context::AddMachine, "the picker's own keys type into the field");
+        press(&mut app, Tab);
+        type_text(&mut app, "https://example.com");
+        let (call, _) = one_call(&press(&mut app, Enter));
+        let refused =
+            CallError { message: "\"https://example.com\" is not a Tailscale name or IP".into(), retry_safe: true };
+        app.update(reply(call, Err(refused.clone())));
+        let typed =
+            FormKind::Add { name: "jkmxlq".into(), address: "https://example.com".into(), field: Field::Address };
+        assert_eq!(form(&app), &MachineForm { kind: typed, state: FormState::Failed(refused.message) });
+        assert!(app.live(Action::Submit), "it can be sent again");
+
+        press(&mut app, Tab);
+        (0..6).for_each(|_| drop(press(&mut app, Backspace)));
+        type_text(&mut app, "Mini");
+        assert!(press(&mut app, Enter).is_empty(), "a bad name never reaches the daemon");
+        assert!(matches!(&form(&app).state, FormState::Failed(why) if why.contains("not a machine name")));
+        press(&mut app, Esc);
+        assert!(matches!(app.screen, Screen::Picker { form: None, .. }));
     }
 
     #[test]

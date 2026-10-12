@@ -9,13 +9,16 @@ pub enum Context {
     Confirm,
     Answer,
     AnswerText,
+    AddMachine,
+    Login,
+    ConfirmRemove,
     Help,
     WrongBuild,
 }
 
 impl Context {
     pub fn takes_text(self) -> bool {
-        matches!(self, Context::Compose | Context::AnswerText)
+        matches!(self, Context::Compose | Context::AnswerText | Context::AddMachine | Context::Login)
     }
 }
 
@@ -25,6 +28,8 @@ pub enum Action {
     Back,
     Up,
     Down,
+    Left,
+    Right,
     Open,
     NextPane,
     Compose,
@@ -34,6 +39,10 @@ pub enum Action {
     Confirm,
     AnswerQuestion,
     Toggle,
+    AddMachine,
+    LogIn,
+    RemoveMachine,
+    NextField,
     ToggleHelp,
     TakeOver,
 }
@@ -56,6 +65,8 @@ impl Binding {
             Tab => "tab".into(),
             Up => "↑".into(),
             Down => "↓".into(),
+            Left => "←".into(),
+            Right => "→".into(),
             other => format!("{other:?}").to_lowercase(),
         };
         match self.mods {
@@ -76,15 +87,18 @@ const fn chord(context: Context, mods: KeyModifiers, code: KeyCode, action: Acti
 
 use Action as A;
 use Context as C;
-use KeyCode::{Char, Down, Enter, Esc, Tab, Up};
+use KeyCode::{Char, Down, Enter, Esc, Left, Right, Tab, Up};
 
 pub const BINDINGS: &[Binding] = &[
     chord(C::Global, KeyModifiers::CONTROL, Char('c'), A::Quit, "quit"),
-    key(C::Picker, Char('j'), A::Down, "next project"),
-    key(C::Picker, Down, A::Down, "next project"),
-    key(C::Picker, Char('k'), A::Up, "previous project"),
-    key(C::Picker, Up, A::Up, "previous project"),
+    key(C::Picker, Char('j'), A::Down, "down"),
+    key(C::Picker, Down, A::Down, "down"),
+    key(C::Picker, Char('k'), A::Up, "up"),
+    key(C::Picker, Up, A::Up, "up"),
     key(C::Picker, Enter, A::Open, "open project"),
+    key(C::Picker, Char('m'), A::AddMachine, "add a machine"),
+    key(C::Picker, Char('l'), A::LogIn, "log in"),
+    key(C::Picker, Char('x'), A::RemoveMachine, "remove machine"),
     key(C::Picker, Char('?'), A::ToggleHelp, "help"),
     key(C::Picker, Char('q'), A::Quit, "quit"),
     key(C::Browse, Tab, A::NextPane, "switch pane"),
@@ -115,6 +129,16 @@ pub const BINDINGS: &[Binding] = &[
     key(C::AnswerText, Down, A::Down, "next option"),
     key(C::AnswerText, Enter, A::Submit, "answer"),
     key(C::AnswerText, Esc, A::Back, "later"),
+    key(C::AddMachine, Tab, A::NextField, "next field"),
+    key(C::AddMachine, Enter, A::Submit, "add"),
+    key(C::AddMachine, Esc, A::Back, "cancel"),
+    key(C::Login, Left, A::Left, "less access"),
+    key(C::Login, Right, A::Right, "more access"),
+    key(C::Login, Enter, A::Submit, "log in"),
+    key(C::Login, Esc, A::Back, "cancel"),
+    key(C::ConfirmRemove, Char('y'), A::Confirm, "remove"),
+    key(C::ConfirmRemove, Char('n'), A::Back, "cancel"),
+    key(C::ConfirmRemove, Esc, A::Back, "cancel"),
     key(C::Help, Char('?'), A::ToggleHelp, "close help"),
     key(C::Help, Esc, A::ToggleHelp, "close help"),
     key(C::WrongBuild, Char('r'), A::TakeOver, "restart the daemon"),
@@ -157,6 +181,9 @@ mod tests {
 
     #[test]
     fn text_contexts_and_global_never_steal_typed_text() {
+        for context in [Context::Compose, Context::AnswerText, Context::AddMachine, Context::Login] {
+            assert!(context.takes_text(), "{context:?} takes text");
+        }
         let typed = |b: &&Binding| {
             matches!(b.code, Char(_))
                 && (b.mods == KeyModifiers::NONE || b.mods == KeyModifiers::SHIFT)
@@ -168,7 +195,7 @@ mod tests {
     #[test]
     fn hints_merge_keys_bound_to_one_action() {
         let picker = hints(Context::Picker);
-        assert_eq!(picker[0], ("j/↓".to_string(), Action::Down, "next project"));
-        assert_eq!(picker.len(), 5);
+        assert_eq!(picker[0], ("j/↓".to_string(), Action::Down, "down"));
+        assert_eq!(picker.len(), 8);
     }
 }
