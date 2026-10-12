@@ -3,14 +3,10 @@ use clap::{
     Parser, Subcommand,
     builder::{PossibleValuesParser, TypedValueParser},
 };
-use seirei::{
-    Started,
-    config::{Added, Config, Endpoint, TailnetOrigin},
-    t3::login::{self, PairingCode},
-};
+use seirei::{Started, config::Config};
 use seirei_proto::{
     ids::MachineId,
-    model::{self, Access, CoordinatorView, MachineProjects, MachineStatus, ProjectView},
+    model::{self, Access, CoordinatorView, MachineProjects, MachineStatus, PAIRING_HINT, ProjectView},
     timeline::Timeline,
     wire::{self, BuildId, CallId, ClientMsg, Command, Reply, ServerMsg, Subscription},
 };
@@ -20,7 +16,7 @@ use std::{
     os::unix::process::CommandExt,
     process::Stdio,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -92,9 +88,6 @@ enum MachineCmd {
     },
 }
 
-const PAIRING_HINT: &str =
-    "In T3 on that machine, create a pairing code (or run `t3 auth pairing create --ttl 10m` there)";
-
 fn access() -> impl TypedValueParser<Value = Access> {
     PossibleValuesParser::new(Access::ALL.map(Access::name))
         .map(|name| Access::ALL.into_iter().find(|access| access.name() == name).expect("clap admits only these names"))
@@ -158,24 +151,17 @@ async fn stop_running() -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// The daemon pairs and saves the credential. Only the prompt for a remote's code runs here.
 async fn login(machine: MachineId, access: Access, code: Option<String>) -> anyhow::Result<()> {
-    let config = Config::load()?;
-    let machine = config.machine(&machine)?;
-    let origin = machine.endpoint.origin()?;
-    let code = match (code, &machine.endpoint) {
-        (Some(code), _) => PairingCode::Given(code),
-        (None, Endpoint::Local { .. }) => PairingCode::Mint,
-        (None, Endpoint::Tailnet(_)) => PairingCode::Given(ask_for_code(&machine.id)?),
+    Config::load()?.machine(&machine)?;
+    let code = match code {
+        None if !machine.is_local() => Some(ask_for_code(&machine)?),
+        code => code,
     };
-    let credentials = login::login(&origin, access, code).await?;
-    let path = config.credentials(&machine.id);
-    login::save(&path, &credentials)?;
-    let days = credentials.expires_at.duration_since(SystemTime::now()).unwrap_or_default().as_secs() / 86_400;
-    println!("Saved a {} credential for {origin} to {}. It expires in {days} days.", access.name(), path.display());
-    if stop_running().await? {
-        println!("Stopped the running daemon; the next `seirei` starts one with the new credential.");
-    }
-    Ok(())
+    let mut client = Client::ready().await?;
+    client.call(Command::Login { machine: machine.clone(), access, code }).await?;
+    println!("Logged in to {machine} with {}.", access.name());
+    report(&mut client, &machine).await
 }
 
 fn ask_for_code(machine: &MachineId) -> anyhow::Result<String> {
@@ -192,29 +178,33 @@ fn ask_for_code(machine: &MachineId) -> anyhow::Result<String> {
 }
 
 async fn add_machine(name: MachineId, address: String) -> anyhow::Result<()> {
-    let origin = TailnetOrigin::parse(&address)?;
-    match Config::load()?.add_machine(&name, &origin)? {
-        Added::AlreadyThere => println!("{name} is already at {origin}."),
-        Added::New => {
-            println!("Added {name} at {origin}.");
-            if stop_running().await? {
-                println!("Stopped the running daemon; the next `seirei` starts one that reaches {name}.");
-            }
-        }
-    }
-    if Config::load()?.machine(&name)?.token.is_none() {
-        println!("Pair with it next: `seirei login {name}`.");
+    let mut client = Client::ready().await?;
+    client.call(Command::AddMachine { name: name.clone(), address }).await?;
+    println!("Added {name}.");
+    report(&mut client, &name).await
+}
+
+async fn remove_machine(name: MachineId) -> anyhow::Result<()> {
+    Client::ready().await?.call(Command::RemoveMachine { machine: name.clone() }).await?;
+    println!("Removed {name}.");
+    Ok(())
+}
+
+async fn report(client: &mut Client, machine: &MachineId) -> anyhow::Result<()> {
+    let Reply::Projects(listed) = client.call(Command::ListProjects).await? else {
+        bail!("ListProjects answered without projects")
+    };
+    if let Some(listed) = listed.iter().find(|listed| &listed.machine.id == machine) {
+        println!("{machine}: {}", reach(listed));
     }
     Ok(())
 }
 
-async fn remove_machine(name: MachineId) -> anyhow::Result<()> {
-    Config::load()?.remove_machine(&name)?;
-    println!("Removed {name}.");
-    if stop_running().await? {
-        println!("Stopped the running daemon; the next `seirei` starts one without {name}.");
+fn reach(MachineProjects { machine, projects }: &MachineProjects) -> String {
+    match (&machine.status, &machine.label) {
+        (MachineStatus::Connected, Some(label)) => format!("connected to {label}, {} projects", projects.len()),
+        _ => machine.status_text(),
     }
-    Ok(())
 }
 
 async fn list_machines() -> anyhow::Result<()> {
@@ -223,10 +213,7 @@ async fn list_machines() -> anyhow::Result<()> {
     let status = |id: &MachineId| match listed.as_ref().map(|listed| listed.iter().find(|l| &l.machine.id == id)) {
         None => String::new(),
         Some(None) => "not known to the running daemon".into(),
-        Some(Some(MachineProjects { machine, projects })) => match (&machine.status, &machine.label) {
-            (MachineStatus::Connected, Some(label)) => format!("connected to {label}, {} projects", projects.len()),
-            _ => machine.status_text(),
-        },
+        Some(Some(listed)) => reach(listed),
     };
     let rows: Vec<[String; 3]> = (config.machines.iter())
         .map(|machine| [machine.id.to_string(), machine.endpoint.address(), status(&machine.id)])
@@ -255,14 +242,7 @@ async fn running_listing() -> anyhow::Result<Option<Vec<MachineProjects>>> {
 }
 
 async fn status(project: Option<String>) -> anyhow::Result<()> {
-    let mut client = Client::connect_or_spawn().await?;
-    match client.hello(false).await? {
-        ServerMsg::Welcome => {}
-        ServerMsg::WrongBuild { daemon } => {
-            bail!("the running daemon is another build ({}); stop it with `seirei daemon --stop`", daemon.0)
-        }
-        other => bail!("unexpected answer to Hello: {other:?}"),
-    }
+    let mut client = Client::ready().await?;
     let Reply::Projects(projects) = client.call(Command::ListProjects).await? else {
         bail!("ListProjects answered without projects")
     };
@@ -343,6 +323,18 @@ impl Client {
             }
         }
         bail!("started a daemon, but it is not listening at {}", wire::socket_path().display())
+    }
+
+    /// A session with a daemon of this build, started when none runs.
+    async fn ready() -> anyhow::Result<Self> {
+        let mut client = Self::connect_or_spawn().await?;
+        match client.hello(false).await? {
+            ServerMsg::Welcome => Ok(client),
+            ServerMsg::WrongBuild { daemon } => {
+                bail!("the running daemon is another build ({}); stop it with `seirei daemon --stop`", daemon.0)
+            }
+            other => bail!("unexpected answer to Hello: {other:?}"),
+        }
     }
 
     async fn hello(&mut self, take_over: bool) -> anyhow::Result<ServerMsg> {

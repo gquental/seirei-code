@@ -25,7 +25,7 @@ Pair seirei with T3 once.
 seirei login
 ```
 
-This runs `t3 auth pairing create` for a pairing code, so the `t3` CLI must be on your `PATH`. To use a code from T3's UI instead, pass `--code`. The credential lasts 30 days. Run `seirei login` again when it lapses.
+This starts the daemon if needed, and the daemon runs `t3 auth pairing create` for a pairing code. So the `t3` CLI must be on your `PATH`. To use a code from T3's UI instead, pass `--code`. The credential lasts 30 days. Run `seirei login` again when it lapses. The daemon uses a new credential at once, so there is nothing to restart.
 
 Then start seirei.
 
@@ -45,8 +45,10 @@ It starts the daemon if needed and opens the project picker.
 | `seirei login [machine] [--access <level>] [--code <code>]` | Pairs with a machine's T3 and saves a credential. The machine defaults to `local`. |
 | `seirei machine add <name> <address>` | Adds the T3 on another machine. |
 | `seirei machine list` | Lists every machine, with its status when a daemon is running. |
-| `seirei machine remove <name>` | Stops reaching a machine. |
+| `seirei machine remove <name>` | Stops reaching a machine and deletes its saved credential. |
 | `seirei daemon [--stop]` | Runs the daemon in the foreground, or stops the running one. |
+
+`seirei login` and `seirei machine add` and `remove` go through the daemon and start it if needed. Each change takes effect at once, and an open `seirei` stays connected.
 
 `--access` sets the most autonomy seirei may act with. The levels are `read-only`, `approval-required`, `auto-accept-edits`, `auto`, and `full-access`, the default. Seirei cannot message or answer a thread that runs above your level. The pane tells you when that happens and which login would fix it.
 
@@ -106,7 +108,7 @@ address = "https://macbook.tail1234.ts.net:4043"
 coordinator_model = "claudeAgent/claude-opus-5-5"
 ```
 
-Without `coordinator_model`, a new coordinator runs on the project's default model in T3. When the project has no default, the coordinator runs on the model of the project's most recent thread, or else on the first model T3 can run. `seirei status <project>` shows the provider and model of the coordinator and each job. Restart the daemon after you change the file.
+Without `coordinator_model`, a new coordinator runs on the project's default model in T3. When the project has no default, the coordinator runs on the model of the project's most recent thread, or else on the first model T3 can run. `seirei status <project>` shows the provider and model of the coordinator and each job. Restart the daemon after you edit the file by hand.
 
 ## How it works
 

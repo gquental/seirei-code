@@ -85,6 +85,10 @@ pub fn find_project(listing: &[MachineProjects], name: &str) -> Result<ProjectRe
     }
 }
 
+/// Where a pairing code for another machine's T3 comes from. Seirei can run only the local `t3`.
+pub const PAIRING_HINT: &str =
+    "In T3 on that machine, create a pairing code (or run `t3 auth pairing create --ttl 10m` there)";
+
 /// The command that pairs seirei with `machine`'s T3.
 pub fn login_command(machine: &MachineId) -> String {
     if machine.is_local() { "seirei login".into() } else { format!("seirei login {machine}") }

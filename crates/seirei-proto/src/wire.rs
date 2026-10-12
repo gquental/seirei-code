@@ -6,8 +6,8 @@
 //! replayed, sequenced, or diffed.
 
 use crate::{
-    ids::{ProjectRef, RequestId, SendId, ThreadId},
-    model::{Answers, MachineProjects, ProjectView},
+    ids::{MachineId, ProjectRef, RequestId, SendId, ThreadId},
+    model::{Access, Answers, MachineProjects, ProjectView},
     timeline::Timeline,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -86,6 +86,23 @@ pub enum Command {
         project: ProjectRef,
         request: RequestId,
         answers: Answers,
+    },
+    /// Reach the T3 at `address` under `name`. The daemon parses the address. Adding a name at
+    /// the address it already has changes nothing.
+    AddMachine {
+        name: MachineId,
+        address: String,
+    },
+    /// Stop reaching `machine`. Its credential and records stay on disk.
+    RemoveMachine {
+        machine: MachineId,
+    },
+    /// Pair with `machine`'s T3 and use the credential at once. Without a code the daemon makes
+    /// one with the local `t3`, so only `local` may leave it out.
+    Login {
+        machine: MachineId,
+        access: Access,
+        code: Option<String>,
     },
     Shutdown,
 }

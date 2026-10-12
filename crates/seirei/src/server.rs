@@ -1,9 +1,17 @@
+use crate::config::{self, Secret, TailnetOrigin, Token};
 use crate::coordinator::ProjectRecord;
 use crate::project::{ProjectCommand, ProjectHandle};
-use crate::t3::{Environment, T3Api, T3Error};
+use crate::t3::{
+    Environment, T3Api, T3Error,
+    login::{self, PairingCode},
+};
+use anyhow::{bail, ensure};
 use seirei_proto::{
     ids::{MachineId, ProjectRef, ThreadId},
-    model::{CoordinatorView, Machine, MachineProjects, MachineStatus, ModelSelection, Project, ProjectView},
+    model::{
+        Access, CoordinatorView, Machine, MachineProjects, MachineStatus, ModelSelection, PAIRING_HINT, Project,
+        ProjectView,
+    },
     timeline::Timeline,
     wire::{self, BuildId, CallError, ClientMsg, Command, MAX_LINE, Reply, ServerMsg, Subscription},
 };
@@ -25,8 +33,12 @@ use tokio::{
 /// unreachable; it never holds up the others.
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Locks are taken in the order `machines`, `identities`, `projects`.
 pub struct Daemon<A> {
-    machines: BTreeMap<MachineId, Arc<MachineApi<A>>>,
+    /// While the daemon runs it is the only writer of `machines.toml` and the credential files.
+    /// Each write happens under this lock together with the registry change it stands for.
+    machines: Mutex<BTreeMap<MachineId, Arc<MachineApi<A>>>>,
+    config_dir: PathBuf,
     state_dir: PathBuf,
     build: BuildId,
     identities: Mutex<Identities>,
@@ -85,6 +97,10 @@ impl Identities {
     }
 }
 
+fn names<V>(machines: &BTreeMap<MachineId, V>) -> String {
+    machines.keys().map(MachineId::as_str).collect::<Vec<_>>().join(", ")
+}
+
 fn machine_dir(state_dir: &Path, machine: &MachineId) -> PathBuf {
     state_dir.join("machines").join(machine.as_str())
 }
@@ -102,6 +118,7 @@ fn read_identity(path: &Path) -> io::Result<Option<Environment>> {
 impl<A: T3Api> Daemon<A> {
     pub fn new(
         machines: impl IntoIterator<Item = (MachineId, MachineApi<A>)>,
+        config_dir: PathBuf,
         state_dir: PathBuf,
     ) -> io::Result<Arc<Self>> {
         let machines: BTreeMap<_, _> = machines.into_iter().map(|(id, machine)| (id, Arc::new(machine))).collect();
@@ -112,7 +129,8 @@ impl<A: T3Api> Daemon<A> {
             }
         }
         Ok(Arc::new(Self {
-            machines,
+            machines: Mutex::new(machines),
+            config_dir,
             state_dir,
             build: BuildId::current(),
             identities: Mutex::new(Identities { known, replaced: BTreeMap::new() }),
@@ -122,9 +140,10 @@ impl<A: T3Api> Daemon<A> {
     }
 
     pub fn warm_start(&self) -> io::Result<()> {
+        let machines: Vec<MachineId> = self.machines.lock().expect("no panics while held").keys().cloned().collect();
         let duplicate =
             |machine: &MachineId| self.identities.lock().expect("no panics while held").owner(machine).is_some();
-        for machine in self.machines.keys().filter(|machine| !duplicate(machine)) {
+        for machine in machines.iter().filter(|machine| !duplicate(machine)) {
             for project in ProjectRecord::saved(&self.records(machine))? {
                 let at = ProjectRef { machine: machine.clone(), project };
                 if let Err(e) = self.project(&at) {
@@ -140,8 +159,10 @@ impl<A: T3Api> Daemon<A> {
     }
 
     /// A duplicate gets no actor, so one T3 never gets a second coordinator under another name.
+    /// The machine stays locked until the actor is registered, so a removal cannot miss it.
     pub fn project(&self, at: &ProjectRef) -> io::Result<ProjectHandle> {
-        let machine = (self.machines.get(&at.machine))
+        let machines = self.machines.lock().expect("no panics while held");
+        let machine = (machines.get(&at.machine))
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no machine is named {}", at.machine)))?;
         let identities = self.identities.lock().expect("no panics while held");
         if let Some(owner) = identities.owner(&at.machine) {
@@ -166,13 +187,15 @@ impl<A: T3Api> Daemon<A> {
     /// all answers are in, so the order the answers arrive in never matters.
     async fn list_projects(&self, timeout: Duration) -> Vec<MachineProjects> {
         let mut listings = JoinSet::new();
-        for (id, machine) in &self.machines {
+        for (id, machine) in self.machines.lock().expect("no panics while held").iter() {
             let (id, machine) = (id.clone(), machine.clone());
             listings.spawn(async move { (id, machine.api.address(), machine.list(timeout).await) });
         }
         let mut answers = listings.join_all().await;
         answers.sort_by(|(a, ..), (b, ..)| a.cmp(b));
+        let registered = self.machines.lock().expect("no panics while held");
         let answers: Vec<_> = (answers.into_iter())
+            .filter(|(id, ..)| registered.contains_key(id))
             .map(|(id, address, answer)| {
                 let projects = answer.and_then(|(environment, projects)| {
                     let failed =
@@ -183,6 +206,7 @@ impl<A: T3Api> Daemon<A> {
                 (id, address, projects)
             })
             .collect();
+        drop(registered);
         let identities = self.identities.lock().expect("no panics while held");
         (answers.into_iter())
             .map(|(id, address, answer)| {
@@ -212,7 +236,7 @@ impl<A: T3Api> Daemon<A> {
                      knew there",
                     read.label, read.environment_id, known.label, known.environment_id
                 );
-                self.projects.lock().expect("no panics while held").retain(|at, _| &at.machine != machine);
+                self.stop_projects(machine);
                 ProjectRecord::forget_all(&self.records(machine))?;
                 identities.replaced.insert(machine.clone(), detail);
             }
@@ -221,6 +245,74 @@ impl<A: T3Api> Daemon<A> {
         let json = serde_json::to_vec_pretty(&read).expect("identities serialize infallibly");
         crate::write_private(&self.records(machine).join("identity.json"), &json)?;
         identities.known.insert(machine.clone(), read);
+        Ok(())
+    }
+
+    /// Stops every actor of `machine`. A session watching one of them sees its feed close.
+    fn stop_projects(&self, machine: &MachineId) {
+        let mut projects = self.projects.lock().expect("no panics while held");
+        for (_, handle) in projects.extract_if(|at, _| &at.machine == machine) {
+            handle.stop();
+        }
+    }
+
+    fn machine(&self, id: &MachineId) -> anyhow::Result<Arc<MachineApi<A>>> {
+        let machines = self.machines.lock().expect("no panics while held");
+        match machines.get(id) {
+            Some(machine) => Ok(machine.clone()),
+            None => bail!("no machine is named {id}; seirei knows {}", names(&machines)),
+        }
+    }
+
+    /// Converges on `id` reaching `address`, both in `machines.toml` and in the registry.
+    fn add_machine(&self, id: &MachineId, address: &str) -> anyhow::Result<()> {
+        let origin = TailnetOrigin::parse(address)?;
+        let mut machines = self.machines.lock().expect("no panics while held");
+        let added = config::add_machine(&self.config_dir, id, &origin)?;
+        if machines.contains_key(id) {
+            return Ok(());
+        }
+        if let Some(identity) = read_identity(&self.records(id).join("identity.json"))? {
+            self.identities.lock().expect("no panics while held").known.insert(id.clone(), identity);
+        }
+        let api = A::connect(added.endpoint, added.token);
+        machines.insert(id.clone(), Arc::new(MachineApi::new(api, added.coordinator_model)));
+        Ok(())
+    }
+
+    /// Its credential and state folder stay, so adding it back picks up where it left off.
+    fn remove_machine(&self, id: &MachineId) -> anyhow::Result<()> {
+        let mut machines = self.machines.lock().expect("no panics while held");
+        let listed = config::remove_machine(&self.config_dir, id)?;
+        if machines.remove(id).is_none() && !listed {
+            bail!("no machine is named {id}; seirei knows {}", names(&machines));
+        }
+        let mut identities = self.identities.lock().expect("no panics while held");
+        identities.known.remove(id);
+        identities.replaced.remove(id);
+        drop(identities);
+        self.stop_projects(id);
+        match std::fs::remove_file(config::credentials(&self.config_dir, id)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The pairing runs unlocked, since it waits on T3. The new credential is saved and swapped
+    /// into the machine's connection only if that connection is still the registered one.
+    async fn login(&self, id: &MachineId, access: Access, code: Option<String>) -> anyhow::Result<()> {
+        let machine = self.machine(id)?;
+        let code = match code {
+            Some(code) => PairingCode::Given(code),
+            None if id.is_local() => PairingCode::Mint,
+            None => bail!("{id} needs a pairing code. {PAIRING_HINT}."),
+        };
+        let credentials = machine.api.pair(access, code).await?;
+        let machines = self.machines.lock().expect("no panics while held");
+        let current = machines.get(id).is_some_and(|held| Arc::ptr_eq(held, &machine));
+        ensure!(current, "{id} was removed while seirei paired with it, so the credential was not saved");
+        login::save(&config::credentials(&self.config_dir, id), &credentials)?;
+        machine.api.use_token(Token { secret: Secret(credentials.token), access: Some(credentials.access) });
         Ok(())
     }
 
@@ -243,8 +335,18 @@ impl<A: T3Api> Daemon<A> {
     }
 
     async fn call(&self, command: Command) -> Result<Reply, CallError> {
+        let refused = |e: anyhow::Error| CallError { message: format!("{e:#}"), retry_safe: true };
         let (project, command) = match command {
             Command::ListProjects => return Ok(Reply::Projects(self.list_projects(LIST_TIMEOUT).await)),
+            Command::AddMachine { name, address } => {
+                return self.add_machine(&name, &address).map(|()| Reply::Done).map_err(refused);
+            }
+            Command::RemoveMachine { machine } => {
+                return self.remove_machine(&machine).map(|()| Reply::Done).map_err(refused);
+            }
+            Command::Login { machine, access, code } => {
+                return self.login(&machine, access, code).await.map(|()| Reply::Done).map_err(refused);
+            }
             Command::Shutdown => {
                 self.shutdown.send_replace(true);
                 return Ok(Reply::Done);
@@ -376,6 +478,7 @@ type TimelineFeed = Option<(ThreadId, watch::Receiver<Arc<Timeline>>)>;
 enum Change {
     View(Arc<ProjectView>),
     Timeline(Arc<Timeline>),
+    Stopped,
 }
 
 impl Feeds {
@@ -403,12 +506,16 @@ impl Feeds {
 
     async fn changed(&mut self) -> Vec<ServerMsg> {
         let change = tokio::select! {
-            view = next_view(&mut self.project) => Change::View(view),
+            view = next_view(&mut self.project) => view.map_or(Change::Stopped, Change::View),
             timeline = next_timeline(&mut self.coordinator) => Change::Timeline(timeline),
             timeline = next_timeline(&mut self.job) => Change::Timeline(timeline),
         };
         match change {
             Change::Timeline(timeline) => vec![ServerMsg::Timeline(timeline)],
+            Change::Stopped => {
+                *self = Self::default();
+                Vec::new()
+            }
             Change::View(view) => {
                 let mut frames = vec![ServerMsg::Project(view)];
                 self.follow(&mut frames).await;
@@ -449,15 +556,23 @@ async fn reopen(
     }
 }
 
-async fn next_view(feed: &mut Option<(ProjectHandle, watch::Receiver<Option<Arc<ProjectView>>>)>) -> Arc<ProjectView> {
-    if let Some((_, view)) = feed {
+/// The next view, or `None` once the project's actor has stopped.
+async fn next_view(
+    feed: &mut Option<(ProjectHandle, watch::Receiver<Option<Arc<ProjectView>>>)>,
+) -> Option<Arc<ProjectView>> {
+    let Some((handle, view)) = feed else { return std::future::pending().await };
+    let changed = async {
         while view.changed().await.is_ok() {
             if let Some(current) = view.borrow_and_update().clone() {
                 return current;
             }
         }
+        std::future::pending().await
+    };
+    tokio::select! {
+        current = changed => Some(current),
+        () = handle.stopped() => None,
     }
-    std::future::pending().await
 }
 
 async fn next_timeline(feed: &mut TimelineFeed) -> Arc<Timeline> {
@@ -476,7 +591,7 @@ mod tests {
     use crate::t3::fake::{Down, FakeT3};
     use seirei_proto::{
         ids::{ProjectId, SendId, T3Time},
-        model::{Lineage, Project},
+        model::{Lineage, Problem, Project},
         wire::{CallId, Command},
     };
     use std::path::Path;
@@ -521,11 +636,11 @@ mod tests {
 
     fn daemon(dir: &Path, machines: impl IntoIterator<Item = (&'static str, FakeT3)>) -> Arc<Daemon<FakeT3>> {
         let machines = machines.into_iter().map(|(name, api)| (machine(name), MachineApi::new(api, None)));
-        Daemon::new(machines, dir.to_path_buf()).expect("the identities load")
+        Daemon::new(machines, dir.join("config"), dir.to_path_buf()).expect("the identities load")
     }
 
-    fn fake<'a>(daemon: &'a Daemon<FakeT3>, name: &str) -> &'a FakeT3 {
-        &daemon.machines[&machine(name)].api
+    fn fake(daemon: &Daemon<FakeT3>, name: &str) -> Arc<FakeT3> {
+        daemon.machines.lock().unwrap()[&machine(name)].api.clone()
     }
 
     async fn reply(client: &mut Client, call: CallId) -> Result<Reply, CallError> {
@@ -742,6 +857,128 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let scans = fake(&daemon, "local").with(|t3| t3.list_calls);
         assert!(scans <= 2, "retrying the unknown job must not force ticks: {scans} scans in 0.5 s");
+    }
+
+    const STUDIO: &str = "https://mac-studio.tail123b88.ts.net";
+
+    fn add(name: &str, address: &str) -> Command {
+        Command::AddMachine { name: machine(name), address: address.into() }
+    }
+
+    async fn settled(
+        view: &mut watch::Receiver<Option<Arc<ProjectView>>>,
+        done: impl FnMut(&Option<Arc<ProjectView>>) -> bool,
+    ) {
+        let waited = tokio::time::timeout(Duration::from_secs(5), view.wait_for(done)).await;
+        waited.expect("the view settles within 5 s").expect("the actor is running");
+    }
+
+    #[tokio::test]
+    async fn a_bad_address_is_refused_with_the_parsers_message_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let daemon = daemon(dir.path(), [("local", FakeT3::new(seirei_code()))]);
+        let refused = daemon.call(add("studio", "https://example.com")).await.expect_err("not a tailnet address");
+        let parser = TailnetOrigin::parse("https://example.com").expect_err("the parser refuses it too");
+        assert_eq!(refused.message, parser.to_string());
+        assert!(!dir.path().join("config/machines.toml").exists(), "nothing was written");
+        assert_eq!(statuses(&daemon).await.len(), 1, "and nothing was added");
+    }
+
+    #[tokio::test]
+    async fn a_login_swaps_the_credential_on_the_machines_own_connection() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let daemon = daemon(dir.path(), [("local", FakeT3::new(seirei_code()))]);
+        assert_eq!(daemon.call(add("studio", &format!("{STUDIO}/"))).await, Ok(Reply::Done));
+        assert_eq!(statuses(&daemon).await[1], ("studio".into(), MachineStatus::NeedsLogin, 0, None));
+        let at = ProjectRef { machine: machine("studio"), project: ProjectId::new("fake") };
+        let actor = daemon.project(&at).expect("an actor on the added machine");
+        let mut view = actor.view();
+        settled(&mut view, |v| v.as_ref().is_some_and(|v| v.health.problem == Some(Problem::Unauthorized))).await;
+
+        let codeless = Command::Login { machine: machine("studio"), access: Access::Auto, code: None };
+        let refused = daemon.call(codeless).await.expect_err("a remote T3 needs a code made there");
+        assert!(refused.message.contains(PAIRING_HINT), "{}", refused.message);
+        let connection = fake(&daemon, "studio");
+        let login = Command::Login { machine: machine("studio"), access: Access::Auto, code: Some("PAIR-1".into()) };
+        assert_eq!(daemon.call(login).await, Ok(Reply::Done));
+
+        assert!(Arc::ptr_eq(&connection, &fake(&daemon, "studio")), "the connection was kept, not replaced");
+        assert_eq!(connection.with(|t3| t3.token.clone()).as_deref(), Some("token-PAIR-1"));
+        let saved = login::load(&dir.path().join("config/credentials/studio.json")).expect("readable").expect("saved");
+        assert_eq!((saved.origin.as_str(), saved.token.as_str(), saved.access), (STUDIO, "token-PAIR-1", Access::Auto));
+        let send = ProjectCommand::Send { thread: ThreadId::new("t"), text: "hi".into(), send_id: SendId::fresh() };
+        actor.call(send).await.expect("the actor still takes commands");
+        settled(&mut view, |v| {
+            v.as_ref().is_some_and(|v| v.health.problem.is_none() && v.access == Some(Access::Auto))
+        })
+        .await;
+        let label = connection.with(|t3| t3.environment.label.clone());
+        assert_eq!(statuses(&daemon).await[1], ("studio".into(), MachineStatus::Connected, 1, Some(label)));
+    }
+
+    #[tokio::test]
+    async fn removing_a_machine_stops_its_actors_and_closes_the_feeds_watching_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let daemon = daemon(dir.path(), [("local", FakeT3::new(seirei_code()))]);
+        daemon.call(add("studio", STUDIO)).await.expect("added");
+        fake(&daemon, "studio").with(|t3| t3.down = None);
+        assert_eq!(statuses(&daemon).await[1].1, MachineStatus::Connected, "its identity is recorded");
+        let watched = ProjectRef { machine: machine("studio"), project: ProjectId::new("fake") };
+        let mut feeds = Feeds::default();
+        feeds.subscribe(&daemon, Subscription { project: Some(watched.clone()), job: None }).await;
+        let actor = daemon.projects.lock().unwrap()[&watched].clone();
+        let local = daemon.project(&ProjectRef { machine: MachineId::local(), project: seirei_code().id }).unwrap();
+        let credential = config::credentials(&dir.path().join("config"), &machine("studio"));
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "{}").unwrap();
+
+        assert_eq!(daemon.call(Command::RemoveMachine { machine: machine("studio") }).await, Ok(Reply::Done));
+        assert!(!credential.exists(), "a removed machine's token does not stay on disk");
+        tokio::time::timeout(Duration::from_secs(5), actor.stopped()).await.expect("studio's actor stopped");
+        let closed = async {
+            while feeds.project.is_some() {
+                feeds.changed().await;
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), closed).await.expect("the session let go of the project");
+        assert_eq!(feeds.subscription, Subscription::default(), "subscribing again starts afresh");
+        assert!(tokio::time::timeout(Duration::from_millis(100), local.stopped()).await.is_err(), "local runs on");
+
+        let listed: Vec<String> = statuses(&daemon).await.into_iter().map(|(id, ..)| id).collect();
+        assert_eq!(listed, ["local"]);
+        assert!(!std::fs::read_to_string(dir.path().join("config/machines.toml")).unwrap().contains("studio"));
+        assert!(
+            dir.path().join("machines/studio/identity.json").exists(),
+            "its identity stays for the duplicate rules"
+        );
+        let again = daemon.call(Command::RemoveMachine { machine: machine("studio") }).await.expect_err("gone");
+        assert!(again.message.contains("no machine is named studio"), "{}", again.message);
+        let local_refused = daemon.call(Command::RemoveMachine { machine: MachineId::local() }).await;
+        assert!(local_refused.is_err(), "local cannot be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_adds_of_different_machines_all_land_in_machines_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let daemon = daemon(dir.path(), [("local", FakeT3::new(seirei_code()))]);
+        let names: Vec<String> = (0..32).map(|i| format!("box-{i:02}")).collect();
+        let start = Arc::new(tokio::sync::Barrier::new(names.len()));
+        let mut adds = JoinSet::new();
+        for name in names.clone() {
+            let (daemon, start) = (daemon.clone(), start.clone());
+            adds.spawn(async move {
+                start.wait().await;
+                daemon.call(add(&name, &format!("https://{name}.tail123b88.ts.net"))).await
+            });
+        }
+        for added in adds.join_all().await {
+            assert_eq!(added, Ok(Reply::Done));
+        }
+        let file = std::fs::read_to_string(dir.path().join("config/machines.toml")).expect("written");
+        let missing: Vec<&String> = names.iter().filter(|name| !file.contains(&format!("[{name}]"))).collect();
+        assert!(missing.is_empty(), "lost from machines.toml: {missing:?}");
+        assert_eq!(statuses(&daemon).await.len(), names.len() + 1, "and every one is connected");
     }
 
     #[tokio::test]
