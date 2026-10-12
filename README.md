@@ -40,8 +40,8 @@ It starts the daemon if needed and opens the project picker.
 | Command | What it does |
 | --- | --- |
 | `seirei` | Opens the project picker. Starts the daemon if needed. |
-| `seirei <project>` | Opens one project's pane, by title or id. |
-| `seirei status [project]` | Prints the project list, or one project's pane, as JSON. |
+| `seirei <project>` | Opens one project's pane, by title or id. Write `<machine>/<project>` when the title is on more than one machine. |
+| `seirei status [project]` | Prints every machine with its status and projects, or one project's pane, as JSON. |
 | `seirei login [--access <level>] [--code <code>]` | Pairs with T3 and saves a credential. |
 | `seirei daemon [--stop]` | Runs the daemon in the foreground, or stops the running one. |
 

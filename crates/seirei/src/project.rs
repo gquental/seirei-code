@@ -1,7 +1,7 @@
 use crate::coordinator::{self, Binding, CoordinatorKey, EnsureStep, ProjectRecord};
 use crate::t3::{PageSize, Position, ReadQuery, T3Api, T3Error, ThreadPage};
 use seirei_proto::{
-    ids::{ItemId, ProjectId, RequestId, SendId, T3Time, ThreadId},
+    ids::{ItemId, MachineId, ProjectId, ProjectRef, RequestId, SendId, T3Time, ThreadId},
     model::{
         Answers, CoordinatorView, Health, ModelSelection, PendingRequest, Problem, Project, ProjectView, ThreadStatus,
         ThreadSummary,
@@ -50,14 +50,15 @@ enum Msg {
 }
 
 impl ProjectHandle {
+    /// `state_dir` holds the records of `at`'s machine only.
     pub fn spawn<A: T3Api>(
         api: Arc<A>,
-        project: ProjectId,
+        at: ProjectRef,
         state_dir: PathBuf,
         coordinator_model: Option<ModelSelection>,
     ) -> io::Result<Self> {
         let view = Arc::new(watch::Sender::new(None));
-        let actor = Actor::new(api, project, state_dir, coordinator_model, view.clone())?;
+        let actor = Actor::new(api, at, state_dir, coordinator_model, view.clone())?;
         let (inbox, messages) = mpsc::channel(32);
         tokio::spawn(actor.run(messages));
         Ok(Self { inbox, view })
@@ -84,6 +85,7 @@ impl ProjectHandle {
 
 struct Actor<A> {
     api: Arc<A>,
+    machine: MachineId,
     id: ProjectId,
     state_dir: PathBuf,
     coordinator_model: Option<ModelSelection>,
@@ -113,15 +115,17 @@ struct Hot {
 impl<A: T3Api> Actor<A> {
     fn new(
         api: Arc<A>,
-        id: ProjectId,
+        at: ProjectRef,
         state_dir: PathBuf,
         coordinator_model: Option<ModelSelection>,
         view: Arc<watch::Sender<Option<Arc<ProjectView>>>>,
     ) -> io::Result<Self> {
+        let ProjectRef { machine, project: id } = at;
         let record = ProjectRecord::load(&state_dir, &id)?;
         let horizon = record.binding.as_ref().map_or(T3Time(0), |binding| binding.minted_after);
         Ok(Self {
             api,
+            machine,
             id,
             state_dir,
             coordinator_model,
@@ -390,6 +394,7 @@ impl<A: T3Api> Actor<A> {
             None | Some(Binding { thread: None, .. }) => (CoordinatorView::Absent, Vec::new()),
         };
         let view = ProjectView {
+            machine: self.machine.clone(),
             project,
             coordinator,
             jobs,
@@ -489,6 +494,10 @@ mod tests {
         }
     }
 
+    fn at(project: ProjectId) -> ProjectRef {
+        ProjectRef { machine: MachineId::local(), project }
+    }
+
     fn actor(api: &Arc<FakeT3>, state_dir: &Path) -> Actor<FakeT3> {
         configured_actor(api, state_dir, None)
     }
@@ -499,7 +508,7 @@ mod tests {
         coordinator_model: Option<ModelSelection>,
     ) -> Actor<FakeT3> {
         let view = Arc::new(watch::Sender::new(None));
-        Actor::new(api.clone(), seirei_code().id, state_dir.to_path_buf(), coordinator_model, view)
+        Actor::new(api.clone(), at(seirei_code().id), state_dir.to_path_buf(), coordinator_model, view)
             .expect("the record loads")
     }
 
@@ -646,7 +655,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let gone = ProjectId::new("mcp:gone");
         let mut actor =
-            Actor::new(api, gone.clone(), dir.path().to_path_buf(), None, Arc::new(watch::Sender::new(None)))
+            Actor::new(api, at(gone.clone()), dir.path().to_path_buf(), None, Arc::new(watch::Sender::new(None)))
                 .expect("no record to load");
         let outcome = actor.tick().await;
         assert!(matches!(outcome, Err(Failure::NoProject(_))), "{outcome:?}");

@@ -54,9 +54,11 @@ pub fn render(app: &App, frame: &mut Frame) {
 fn title_bar(app: &App, frame: &mut Frame, area: Rect) {
     let mut crumbs = vec![Span::styled(" seirei", Modifier::BOLD)];
     if let Screen::Project(p) = &app.screen {
+        let listed =
+            || app.listed().find(|(machine, project)| machine.id == p.id.machine && project.id == p.id.project);
         let title = (p.view.as_deref().map(|v| v.project.title.as_str()).filter(|title| !title.is_empty()))
-            .or_else(|| app.projects.iter().find(|project| project.id == p.id).map(|project| project.title.as_str()))
-            .unwrap_or(p.id.as_str());
+            .or_else(|| listed().map(|(_, project)| project.title.as_str()))
+            .unwrap_or(p.id.project.as_str());
         crumbs.push(Span::raw(format!(" › {title}")));
         if let Focus::Job { thread, .. } = &p.focus {
             crumbs.push(Span::raw(format!(" › {}", thread_title(p.view.as_deref(), thread))));
@@ -109,7 +111,7 @@ fn picker(app: &App, cursor: usize, frame: &mut Frame, area: Rect) {
     let block = Block::new().title(Line::styled("  Projects", Modifier::BOLD)).padding(Padding::top(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if app.projects.is_empty() {
+    if app.listed().next().is_none() {
         let message = match app.link {
             Link::Up if app.loading_projects() => "Loading projects…",
             Link::Up => "T3 has no projects yet. Add one in T3 Code.",
@@ -118,8 +120,8 @@ fn picker(app: &App, cursor: usize, frame: &mut Frame, area: Rect) {
         frame.render_widget(Line::styled(format!("  {message}"), dim()), inner);
         return;
     }
-    let title_width = app.projects.iter().map(|p| p.title.width()).max().unwrap_or(0);
-    let rows = app.projects.iter().map(|p| {
+    let title_width = app.listed().map(|(_, p)| p.title.width()).max().unwrap_or(0);
+    let rows = app.listed().map(|(_, p)| {
         let pad = " ".repeat(title_width - p.title.width());
         ListItem::new(Line::from(vec![
             Span::raw(format!("{}{pad}   ", p.title)),
@@ -721,7 +723,7 @@ mod tests {
         let mut app = new_app(None);
         assert!(screen(&app, 80, 10).contains("Connecting to the seirei daemon"));
         app.update(Event::Server(ServerMsg::Welcome));
-        let projects = vec![project_meta("a", "alpha"), project_meta("b", "seirei-code")];
+        let projects = local(vec![project_meta("a", "alpha"), project_meta("b", "seirei-code")]);
         app.update(Event::Server(ServerMsg::Reply { id: CallId(1), result: Ok(Reply::Projects(projects)) }));
         let shown = screen(&app, 80, 10);
         assert!(shown.contains("› alpha"), "{shown}");

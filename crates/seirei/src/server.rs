@@ -1,39 +1,78 @@
 use crate::coordinator::ProjectRecord;
 use crate::project::{ProjectCommand, ProjectHandle};
-use crate::t3::T3Api;
+use crate::t3::{T3Api, T3Error};
 use seirei_proto::{
-    ids::{ProjectId, ThreadId},
-    model::{CoordinatorView, ModelSelection, ProjectView},
+    ids::{MachineId, ProjectRef, ThreadId},
+    model::{CoordinatorView, Machine, MachineProjects, MachineStatus, ModelSelection, ProjectView},
     timeline::Timeline,
     wire::{self, BuildId, CallError, ClientMsg, Command, MAX_LINE, Reply, ServerMsg, Subscription},
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixListener,
     sync::{mpsc, watch},
+    task::JoinSet,
 };
 
+/// How long `ListProjects` waits for any one machine. A machine that misses it is listed as
+/// unreachable; it never holds up the others.
+const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct Daemon<A> {
-    api: Arc<A>,
+    machines: BTreeMap<MachineId, Arc<MachineApi<A>>>,
     state_dir: PathBuf,
-    coordinator_model: Option<ModelSelection>,
     build: BuildId,
-    projects: Mutex<HashMap<ProjectId, ProjectHandle>>,
+    projects: Mutex<HashMap<ProjectRef, ProjectHandle>>,
     shutdown: watch::Sender<bool>,
 }
 
+/// One machine's T3, and how the daemon acts on it.
+pub struct MachineApi<A> {
+    api: Arc<A>,
+    coordinator_model: Option<ModelSelection>,
+}
+
+impl<A> MachineApi<A> {
+    pub fn new(api: A, coordinator_model: Option<ModelSelection>) -> Self {
+        Self { api: Arc::new(api), coordinator_model }
+    }
+}
+
+impl<A: T3Api> MachineApi<A> {
+    async fn list(&self, id: MachineId, timeout: Duration) -> MachineProjects {
+        let (status, projects) = match tokio::time::timeout(timeout, self.api.projects()).await {
+            Ok(Ok(projects)) => (MachineStatus::Connected, projects),
+            Ok(Err(e)) => (machine_status(&e), Vec::new()),
+            Err(_) => {
+                let detail = format!("no answer within {timeout:?}");
+                (MachineStatus::Unreachable { detail }, Vec::new())
+            }
+        };
+        MachineProjects { machine: Machine { id, address: self.api.address(), label: None, status }, projects }
+    }
+}
+
+fn machine_status(e: &T3Error) -> MachineStatus {
+    match e {
+        T3Error::Unauthorized => MachineStatus::NeedsLogin,
+        T3Error::Unreachable(detail) | T3Error::Lost(detail) => MachineStatus::Unreachable { detail: detail.clone() },
+        T3Error::NoSession(cause) => machine_status(cause),
+        T3Error::Rejected(_) | T3Error::Malformed(_) => MachineStatus::Failed { detail: e.to_string() },
+    }
+}
+
 impl<A: T3Api> Daemon<A> {
-    pub fn new(api: A, state_dir: PathBuf, coordinator_model: Option<ModelSelection>) -> Arc<Self> {
+    pub fn new(machines: impl IntoIterator<Item = (MachineId, MachineApi<A>)>, state_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
-            api: Arc::new(api),
+            machines: machines.into_iter().map(|(id, machine)| (id, Arc::new(machine))).collect(),
             state_dir,
-            coordinator_model,
             build: BuildId::current(),
             projects: Mutex::default(),
             shutdown: watch::Sender::new(false),
@@ -41,23 +80,47 @@ impl<A: T3Api> Daemon<A> {
     }
 
     pub fn warm_start(&self) -> io::Result<()> {
-        for project in ProjectRecord::saved(&self.state_dir)? {
-            if let Err(e) = self.project(&project) {
-                eprintln!("seirei: not syncing project {}: {e}", project.as_str());
+        for machine in self.machines.keys() {
+            for project in ProjectRecord::saved(&self.records(machine))? {
+                let at = ProjectRef { machine: machine.clone(), project };
+                if let Err(e) = self.project(&at) {
+                    eprintln!("seirei: not syncing project {at}: {e}");
+                }
             }
         }
         Ok(())
     }
 
-    pub fn project(&self, id: &ProjectId) -> io::Result<ProjectHandle> {
+    fn records(&self, machine: &MachineId) -> PathBuf {
+        self.state_dir.join("machines").join(machine.as_str())
+    }
+
+    pub fn project(&self, at: &ProjectRef) -> io::Result<ProjectHandle> {
+        let machine = (self.machines.get(&at.machine))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no machine is named {}", at.machine)))?;
         let mut projects = self.projects.lock().expect("no panics while held");
-        if let Some(handle) = projects.get(id) {
+        if let Some(handle) = projects.get(at) {
             return Ok(handle.clone());
         }
-        let handle =
-            ProjectHandle::spawn(self.api.clone(), id.clone(), self.state_dir.clone(), self.coordinator_model.clone())?;
-        projects.insert(id.clone(), handle.clone());
+        let handle = ProjectHandle::spawn(
+            machine.api.clone(),
+            at.clone(),
+            self.records(&at.machine),
+            machine.coordinator_model.clone(),
+        )?;
+        projects.insert(at.clone(), handle.clone());
         Ok(handle)
+    }
+
+    async fn list_projects(&self, timeout: Duration) -> Vec<MachineProjects> {
+        let mut listings = JoinSet::new();
+        for (id, machine) in &self.machines {
+            let (id, machine) = (id.clone(), machine.clone());
+            listings.spawn(async move { machine.list(id, timeout).await });
+        }
+        let mut listed = listings.join_all().await;
+        listed.sort_by(|a, b| a.machine.id.cmp(&b.machine.id));
+        listed
     }
 
     pub async fn serve(self: Arc<Self>, listener: UnixListener) -> io::Result<()> {
@@ -80,12 +143,7 @@ impl<A: T3Api> Daemon<A> {
 
     async fn call(&self, command: Command) -> Result<Reply, CallError> {
         let (project, command) = match command {
-            Command::ListProjects => {
-                let projects = self.api.projects().await;
-                return projects
-                    .map(Reply::Projects)
-                    .map_err(|e| CallError { message: e.to_string(), retry_safe: true });
-            }
+            Command::ListProjects => return Ok(Reply::Projects(self.list_projects(LIST_TIMEOUT).await)),
             Command::Shutdown => {
                 self.shutdown.send_replace(true);
                 return Ok(Reply::Done);
@@ -225,7 +283,7 @@ impl Feeds {
             self.project = wanted.project.as_ref().and_then(|id| match daemon.project(id) {
                 Ok(handle) => Some((handle.clone(), handle.view())),
                 Err(e) => {
-                    eprintln!("seirei: cannot sync project {}: {e}", id.as_str());
+                    eprintln!("seirei: cannot sync project {id}: {e}");
                     None
                 }
             });
@@ -314,13 +372,13 @@ async fn next_timeline(feed: &mut TimelineFeed) -> Arc<Timeline> {
 mod tests {
     use super::*;
     use crate::coordinator::{Binding, CoordinatorKey};
-    use crate::t3::fake::FakeT3;
+    use crate::t3::fake::{Down, FakeT3};
     use seirei_proto::{
-        ids::{SendId, T3Time},
+        ids::{ProjectId, SendId, T3Time},
         model::{Lineage, Project},
         wire::{CallId, Command},
     };
-    use std::time::Duration;
+    use std::path::Path;
     use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 
     fn seirei_code() -> Project {
@@ -356,18 +414,43 @@ mod tests {
         }
     }
 
+    fn machine(name: &str) -> MachineId {
+        MachineId::parse(name).expect("a machine name")
+    }
+
+    fn daemon(dir: &Path, machines: impl IntoIterator<Item = (&'static str, FakeT3)>) -> Arc<Daemon<FakeT3>> {
+        let machines = machines.into_iter().map(|(name, api)| (machine(name), MachineApi::new(api, None)));
+        Daemon::new(machines, dir.to_path_buf())
+    }
+
+    fn fake<'a>(daemon: &'a Daemon<FakeT3>, name: &str) -> &'a FakeT3 {
+        &daemon.machines[&machine(name)].api
+    }
+
+    async fn reply(client: &mut Client, call: CallId) -> Result<Reply, CallError> {
+        loop {
+            match client.recv().await {
+                Some(ServerMsg::Reply { id, result }) if id == call => return result,
+                Some(ServerMsg::Project(_) | ServerMsg::Timeline(_)) => continue,
+                other => panic!("expected the reply to {call:?}, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn a_session_greets_subscribes_and_routes_calls() {
+    async fn a_session_routes_each_project_to_its_own_machine() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let daemon = Daemon::new(FakeT3::new(seirei_code()), dir.path().to_path_buf(), None);
+        let daemon =
+            daemon(dir.path(), [("local", FakeT3::new(seirei_code())), ("studio", FakeT3::new(seirei_code()))]);
         let mut client = Client::connect(&daemon);
         client.send(ClientMsg::Hello { build: BuildId::current(), take_over: false }).await;
         assert_eq!(client.recv().await, Some(ServerMsg::Welcome));
 
-        client.send(ClientMsg::Subscribe(Subscription { project: Some(seirei_code().id), job: None })).await;
+        let studio = ProjectRef { machine: machine("studio"), project: seirei_code().id };
+        client.send(ClientMsg::Subscribe(Subscription { project: Some(studio.clone()), job: None })).await;
         match client.recv().await {
             Some(ServerMsg::Project(view)) => {
-                assert_eq!(view.project, seirei_code());
+                assert_eq!((&view.machine, &view.project), (&studio.machine, &seirei_code()));
                 assert_eq!(view.coordinator, CoordinatorView::Absent);
             }
             other => panic!("the first frame after Subscribe is the project view, got {other:?}"),
@@ -375,24 +458,60 @@ mod tests {
 
         let send_id = SendId::fresh();
         let send = Command::Send {
-            project: seirei_code().id,
+            project: studio.clone(),
             thread: ThreadId::new("mcp:coordinator"),
             text: "Plan the cache".into(),
             send_id: send_id.clone(),
         };
         client.send(ClientMsg::Call { id: CallId(7), command: send }).await;
-        loop {
-            match client.recv().await {
-                Some(ServerMsg::Reply { id, result }) => {
-                    assert_eq!((id, result), (CallId(7), Ok(Reply::Done)), "the reply answers the call");
-                    break;
-                }
-                Some(ServerMsg::Project(_)) => continue,
-                other => panic!("expected the call's reply, got {other:?}"),
-            }
-        }
-        let sent = daemon.api.with(|t3| t3.sends.clone());
+        assert_eq!(reply(&mut client, CallId(7)).await, Ok(Reply::Done), "the reply answers the call");
+        let sent = fake(&daemon, "studio").with(|t3| t3.sends.clone());
         assert_eq!(sent, [(ThreadId::new("mcp:coordinator"), "Plan the cache".to_owned(), send_id)]);
+        assert!(fake(&daemon, "local").with(|t3| t3.sends.is_empty()), "the same project id on local is not studio's");
+
+        client.send(ClientMsg::Call { id: CallId(8), command: Command::EnsureCoordinator { project: studio } }).await;
+        assert_eq!(reply(&mut client, CallId(8)).await, Ok(Reply::Done));
+        assert_eq!(fake(&daemon, "studio").with(|t3| t3.launched.len()), 1);
+        assert_eq!(fake(&daemon, "local").with(|t3| t3.launched.len()), 0);
+        let record = format!("machines/studio/projects/{}.json", seirei_code().id.as_str());
+        assert!(dir.path().join(record).exists(), "each machine keeps its own records");
+    }
+
+    #[tokio::test]
+    async fn listing_projects_reports_every_machine_and_never_fails_for_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let down = |down| {
+            let api = FakeT3::new(seirei_code());
+            api.with(|t3| t3.down = Some(down));
+            api
+        };
+        let daemon = daemon(
+            dir.path(),
+            [
+                ("studio", FakeT3::new(seirei_code())),
+                ("macbook", down(Down::LoggedOut)),
+                ("quiet", down(Down::Silent)),
+                ("local", down(Down::Refused)),
+            ],
+        );
+        let listed = daemon.list_projects(Duration::from_millis(200)).await;
+        let shown: Vec<(&str, &MachineStatus, Vec<&str>)> = (listed.iter())
+            .map(|listed| {
+                let titles = listed.projects.iter().map(|project| project.title.as_str()).collect();
+                (listed.machine.id.as_str(), &listed.machine.status, titles)
+            })
+            .collect();
+        let unreachable = |detail: &str| MachineStatus::Unreachable { detail: detail.into() };
+        assert_eq!(
+            shown,
+            [
+                ("local", &unreachable("connection refused"), vec![]),
+                ("macbook", &MachineStatus::NeedsLogin, vec![]),
+                ("quiet", &unreachable("no answer within 200ms"), vec![]),
+                ("studio", &MachineStatus::Connected, vec!["seirei-code"]),
+            ],
+            "local first, then by name; a failing machine lists nothing and fails nothing"
+        );
     }
 
     #[tokio::test]
@@ -401,24 +520,26 @@ mod tests {
         let api = FakeT3::new(seirei_code());
         let coordinator = api.with(|t3| t3.add("mcp:coordinator", "Coordinator", Lineage::Root { via_mcp: true }));
         let binding = Binding { key: CoordinatorKey::mint(), minted_after: T3Time(0), thread: Some(coordinator) };
-        ProjectRecord { binding: Some(binding) }.save(dir.path(), &seirei_code().id).expect("record saved");
-        let daemon = Daemon::new(api, dir.path().to_path_buf(), None);
+        let records = dir.path().join("machines/local");
+        ProjectRecord { binding: Some(binding) }.save(&records, &seirei_code().id).expect("record saved");
+        let daemon = daemon(dir.path(), [("local", api)]);
         let mut client = Client::connect(&daemon);
         client.send(ClientMsg::Hello { build: BuildId::current(), take_over: false }).await;
         assert_eq!(client.recv().await, Some(ServerMsg::Welcome));
 
-        let wanted = Subscription { project: Some(seirei_code().id), job: Some(ThreadId::new("mcp:stranger")) };
+        let project = ProjectRef { machine: MachineId::local(), project: seirei_code().id };
+        let wanted = Subscription { project: Some(project), job: Some(ThreadId::new("mcp:stranger")) };
         client.send(ClientMsg::Subscribe(wanted)).await;
         assert!(matches!(client.recv().await, Some(ServerMsg::Project(_))), "the view still streams");
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let scans = daemon.api.with(|t3| t3.list_calls);
+        let scans = fake(&daemon, "local").with(|t3| t3.list_calls);
         assert!(scans <= 2, "retrying the unknown job must not force ticks: {scans} scans in 0.5 s");
     }
 
     #[tokio::test]
     async fn another_build_is_told_and_disconnected() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let daemon = Daemon::new(FakeT3::new(seirei_code()), dir.path().to_path_buf(), None);
+        let daemon = daemon(dir.path(), [("local", FakeT3::new(seirei_code()))]);
         let mut client = Client::connect(&daemon);
         client.send(ClientMsg::Hello { build: BuildId("0.0.0+elsewhere".into()), take_over: false }).await;
         assert_eq!(client.recv().await, Some(ServerMsg::WrongBuild { daemon: BuildId::current() }));

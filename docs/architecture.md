@@ -9,7 +9,7 @@ A background daemon owns the connection to T3 and the synced state. TUI clients 
 ```
 $ seirei login               # once: pair with T3, save a 30-day credential
 $ seirei                     # attach (starting the daemon if needed) and open the project picker
-$ seirei seirei-code         # straight to one project's pane
+$ seirei seirei-code         # straight to one project's pane; `<machine>/seirei-code` when the title is on several machines
 $ seirei status seirei-code  # the same pane as JSON, for scripts and debugging
 $ seirei daemon              # the daemon in the foreground
 $ seirei daemon --stop
@@ -39,31 +39,41 @@ Seirei talks to T3's MCP server over streamable HTTP. The origin comes from `<T3
 
 Module map:
 
-- `seirei_proto::ids` holds opaque T3 ids, `SendId`, and `T3Time`.
-- `seirei_proto::model` holds projects, thread summaries, model selections, runtime modes and the credential's `Access`, lineage, jobs, the coordinator view, questions, and health.
+- `seirei_proto::ids` holds opaque T3 ids, `MachineId`, `ProjectRef`, `SendId`, and `T3Time`.
+- `seirei_proto::model` holds machines and their status, projects, thread summaries, model selections, runtime modes and the credential's `Access`, lineage, jobs, the coordinator view, questions, and health.
 - `seirei_proto::timeline` holds timeline items, the open-set `ItemKind`, and the window.
 - `seirei_proto::wire` holds the socket protocol.
-- `seirei::config` decides where configuration and credentials come from.
+- `seirei::config` decides which machines exist and where their configuration and credentials come from.
 - `seirei::t3` is the `T3Api` seam, page sizes, positions, and the error taxonomy. `t3::mcp` speaks MCP over HTTP. `t3::wire` turns T3's JSON into domain types. `t3::login` runs the pairing flow.
 - `seirei::coordinator` decides attribution, the coordinator key and tags, the coordinator's model, the brief, and the ensure state machine.
 - `seirei::project` is one actor per project. It owns the scan, timeline refresh, commands, and publishing.
-- `seirei::server` owns sessions, the handshake, routing, and the actor registry.
+- `seirei::server` owns the machines, sessions, the handshake, routing, and the actor registry.
 - `seirei_tui::app` is the TUI state machine, `keymap` every binding, and `render` the drawing.
 
 ## The daemon's state
 
-Each watched project has one actor task, the only writer of that project's state and durable record. Sync ticks and user commands for a project run on that task. So "ensure coordinator" cannot race the scan that would adopt the coordinator it is creating. There is no lock around project state. The only shared structure is the registry that maps a project id to its actor, guarded for get-or-spawn.
+Each watched project has one actor task, the only writer of that project's state and durable record. Sync ticks and user commands for a project run on that task. So "ensure coordinator" cannot race the scan that would adopt the coordinator it is creating. There is no lock around project state. The only shared structure is the registry that maps a `ProjectRef` to its actor, guarded for get-or-spawn.
 
 Actors publish through `watch` channels. Each project has one `Arc<ProjectView>`, and each open timeline has one `Arc<Timeline>`. A slow reader skips to the latest value. Interest is channel liveness. A timeline stays hot exactly as long as some session holds its receiver, and the view's receiver count picks the polling cadence.
 
-The only durable state is `<state_dir>/projects/<project>.json`, holding the coordinator binding. Everything else is rebuilt from T3 after a restart.
+The only durable state is `<state_dir>/machines/<machine>/projects/<project>.json`, holding the coordinator binding. Everything else is rebuilt from T3 after a restart.
+
+## Machines
+
+A machine is one T3 server. `local` is the T3 on this machine, found through `server-runtime.json`. T3 ids are unique only within one T3, so the daemon keys every project by `ProjectRef`, its machine and its T3 id. Thread ids stay plain, because every thread reference travels inside a project's scope.
+
+Each machine has its own `T3Api`, credential, and state folder. Nothing is shared between machines. `seirei login` saves the credential to `<config_dir>/credentials/<machine>.json`. A token from `$SEIREI_T3_TOKEN` or `t3_token` applies to `local` only.
+
+`ListProjects` asks every machine at once and waits at most 5 s for each. A machine that fails lists no projects and reports why: `NeedsLogin` for a missing, lapsed, or rejected credential, `Unreachable` when T3 does not answer, and `Failed` when it answers with something other than its projects. One machine never fails the whole call. A call goes out even without a credential, so a T3 that is down reads as unreachable rather than as a missing login.
+
+A bare project title that more than one machine lists is ambiguous. `seirei` and `seirei status` then ask for `<machine>/<project>`.
 
 ## The protocol
 
 - **Framing.** One JSON object per line over a Unix socket at `$SEIREI_SOCKET`, else `$XDG_RUNTIME_DIR/seirei/daemon.sock`. You can debug it with `socat`.
 - **Versioning.** The TUI and daemon are one executable, so the protocol needs build detection, not compatibility rules. `Hello`, `Welcome`, `WrongBuild`, and `Yielding` are frozen. Every other shape may change in any build. A TUI that finds an older daemon offers to restart it.
 - **What crosses.** Whole domain values. `Project(ProjectView)` carries the pane, and `Timeline` carries one thread's window. Nothing is a delta, a sequence number, or a view model.
-- **Convergence.** `Subscribe { project, job }` is declarative and replaces the last one. A reconnecting client sends `Hello` and its current subscription, and its first frames are the full current values.
+- **Convergence.** `Subscribe { project, job }` is declarative and replaces the last one. `project` is a `ProjectRef`, and every `Project` frame names its machine. A reconnecting client sends `Hello` and its current subscription, and its first frames are the full current values.
 
 ## Sync
 
