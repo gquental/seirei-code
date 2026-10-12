@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p seirei --target aarch64-apple-darwin
+      - run: cargo build --release --locked -p seirei --target x86_64-apple-darwin
+      - name: Package the universal binary
+        id: package
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "seirei") | .version')
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
+            exit 1
+          fi
+          mkdir -p dist/seirei
+          lipo -create -output dist/seirei/seirei \
+            target/aarch64-apple-darwin/release/seirei \
+            target/x86_64-apple-darwin/release/seirei
+          lipo -info dist/seirei/seirei
+          dist/seirei/seirei --version
+          cp README.md dist/seirei/
+          archive="seirei-v$version-macos-universal.tar.gz"
+          tar -C dist -czf "dist/$archive" seirei
+          (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seirei-macos-universal
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          cat > notes.md <<EOF
+          ## Install on macOS
+
+          The archive holds one universal binary for Apple Silicon and Intel Macs.
+
+          \`\`\`
+          gh release download $GITHUB_REF_NAME -R $GITHUB_REPOSITORY -p '$ARCHIVE'
+          tar -xzf $ARCHIVE
+          sudo mkdir -p /usr/local/bin
+          sudo install seirei/seirei /usr/local/bin/seirei
+          \`\`\`
+
+          The binary is not signed by Apple. A download through \`gh\` or \`curl\` runs as is. If you download it with a browser, macOS blocks it the first time. Clear the block with \`xattr -d com.apple.quarantine seirei/seirei\`.
+
+          Then log in to the T3 on this Mac with \`seirei login\`, or add another machine with \`seirei machine add\`, and start \`seirei\`. \`seirei login\` makes its pairing code with the \`t3\` command. If \`t3\` is not on your PATH, create a pairing code in T3's settings and pass it with \`seirei login --code <code>\`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            --title "seirei $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --generate-notes \
+            "dist/$ARCHIVE" "dist/$ARCHIVE.sha256"
