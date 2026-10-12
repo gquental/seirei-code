@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/seirei-proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[workspace.dependencies]
+seirei-proto = { path = "crates/seirei-proto" }
+seirei-tui = { path = "crates/seirei-tui" }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs", "signal"] }
+thiserror = "2"
+anyhow = "1"
