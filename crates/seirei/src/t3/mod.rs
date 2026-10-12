@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub mod fake;
 pub mod login;
 mod mcp;
 mod wire;
