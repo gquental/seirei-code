@@ -1,0 +1,45 @@
+{
+  "requestId": "request:ask-01",
+  "questions": [
+    {
+      "id": "backend",
+      "header": "Backend",
+      "question": "Which cache backend?",
+      "options": [
+        {
+          "label": "In memory",
+          "description": "Fast, lost on restart",
+          "value": "memory"
+        },
+        {
+          "label": "SQLite",
+          "description": "Durable"
+        }
+      ],
+      "multiSelect": null,
+      "allowCustomAnswer": null,
+      "initialAnswer": null,
+      "required": null
+    },
+    {
+      "id": "targets",
+      "header": "Targets",
+      "question": "Which crates?",
+      "options": [
+        {
+          "label": "seirei",
+          "description": "",
+          "value": null
+        },
+        {
+          "label": "seirei-proto",
+          "description": "",
+          "value": "proto"
+        }
+      ],
+      "multiSelect": true,
+      "allowCustomAnswer": false,
+      "required": false
+    }
+  ]
+}
