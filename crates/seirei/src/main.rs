@@ -5,18 +5,18 @@ use clap::{
 };
 use seirei::{
     Started,
-    config::Config,
+    config::{Added, Config, Endpoint, TailnetOrigin},
     t3::login::{self, PairingCode},
 };
 use seirei_proto::{
     ids::MachineId,
-    model::{self, Access, CoordinatorView, ProjectView},
+    model::{self, Access, CoordinatorView, MachineProjects, MachineStatus, ProjectView},
     timeline::Timeline,
     wire::{self, BuildId, CallId, ClientMsg, Command, Reply, ServerMsg, Subscription},
 };
 use serde::Serialize;
 use std::{
-    io,
+    io::{self, IsTerminal},
     os::unix::process::CommandExt,
     process::Stdio,
     sync::Arc,
@@ -48,14 +48,24 @@ enum Cmd {
         #[arg(long)]
         stop: bool,
     },
-    /// Pair with T3 and save a 30-day credential. Needed once, and again when it lapses.
+    /// Pair with a machine's T3 and save a 30-day credential. Needed once per machine, and again
+    /// when it lapses.
     Login {
+        /// The machine to pair with.
+        #[arg(default_value = MachineId::LOCAL, value_parser = MachineId::parse)]
+        machine: MachineId,
         /// The most autonomy seirei may act with. Threads above it are read-only to seirei.
         #[arg(long, default_value = "full-access", value_parser = access())]
         access: Access,
-        /// A pairing code from T3's UI. Without one, seirei runs `t3 auth pairing create`.
+        /// A pairing code from T3 on that machine. Without one, seirei runs `t3 auth pairing
+        /// create` for `local`, and asks for a code for any other machine.
         #[arg(long)]
         code: Option<String>,
+    },
+    /// Add, list, or remove the T3 servers seirei reaches on other machines.
+    Machine {
+        #[command(subcommand)]
+        command: MachineCmd,
     },
     /// Print what the daemon knows, as JSON: every machine and its projects, or one project's pane.
     Status {
@@ -63,6 +73,27 @@ enum Cmd {
         project: Option<String>,
     },
 }
+
+#[derive(Subcommand)]
+enum MachineCmd {
+    /// Reach the T3 at `address` under `name`. For now it must be a Tailscale address, like
+    /// https://macbook.tail1234.ts.net:4043.
+    Add {
+        #[arg(value_parser = MachineId::parse)]
+        name: MachineId,
+        address: String,
+    },
+    /// Every machine and its address, with its status when a daemon is running.
+    List,
+    /// Stop reaching a machine. Its credential and records stay on disk.
+    Remove {
+        #[arg(value_parser = MachineId::parse)]
+        name: MachineId,
+    },
+}
+
+const PAIRING_HINT: &str =
+    "In T3 on that machine, create a pairing code (or run `t3 auth pairing create --ttl 10m` there)";
 
 fn access() -> impl TypedValueParser<Value = Access> {
     PossibleValuesParser::new(Access::ALL.map(Access::name))
@@ -78,7 +109,12 @@ fn main() -> anyhow::Result<()> {
             Started::AlreadyRunning => bail!("a daemon is already running; stop it with `seirei daemon --stop`"),
         },
         Some(Cmd::Daemon { stop: true }) => runtime.block_on(stop_daemon()),
-        Some(Cmd::Login { access, code }) => runtime.block_on(login(access, code)),
+        Some(Cmd::Login { machine, access, code }) => runtime.block_on(login(machine, access, code)),
+        Some(Cmd::Machine { command: MachineCmd::Add { name, address } }) => {
+            runtime.block_on(add_machine(name, address))
+        }
+        Some(Cmd::Machine { command: MachineCmd::List }) => runtime.block_on(list_machines()),
+        Some(Cmd::Machine { command: MachineCmd::Remove { name } }) => runtime.block_on(remove_machine(name)),
         Some(Cmd::Status { project }) => runtime.block_on(status(project)),
         None => runtime.block_on(seirei_tui::run(seirei_tui::Launch {
             socket: wire::socket_path(),
@@ -122,11 +158,16 @@ async fn stop_running() -> anyhow::Result<bool> {
     Ok(true)
 }
 
-async fn login(access: Access, code: Option<String>) -> anyhow::Result<()> {
+async fn login(machine: MachineId, access: Access, code: Option<String>) -> anyhow::Result<()> {
     let config = Config::load()?;
-    let machine = config.machine(&MachineId::local())?;
-    let origin = seirei::t3::origin(&machine.t3_home)?;
-    let credentials = login::login(&origin, access, code.map_or(PairingCode::Mint, PairingCode::Given)).await?;
+    let machine = config.machine(&machine)?;
+    let origin = machine.endpoint.origin()?;
+    let code = match (code, &machine.endpoint) {
+        (Some(code), _) => PairingCode::Given(code),
+        (None, Endpoint::Local { .. }) => PairingCode::Mint,
+        (None, Endpoint::Tailnet(_)) => PairingCode::Given(ask_for_code(&machine.id)?),
+    };
+    let credentials = login::login(&origin, access, code).await?;
     let path = config.credentials(&machine.id);
     login::save(&path, &credentials)?;
     let days = credentials.expires_at.duration_since(SystemTime::now()).unwrap_or_default().as_secs() / 86_400;
@@ -135,6 +176,82 @@ async fn login(access: Access, code: Option<String>) -> anyhow::Result<()> {
         println!("Stopped the running daemon; the next `seirei` starts one with the new credential.");
     }
     Ok(())
+}
+
+fn ask_for_code(machine: &MachineId) -> anyhow::Result<String> {
+    if !io::stdin().is_terminal() {
+        bail!("{PAIRING_HINT}, then run `seirei login {machine} --code <code>`.");
+    }
+    eprint!("{PAIRING_HINT}.\nPairing code for {machine}: ");
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    match line.trim() {
+        "" => bail!("no pairing code given"),
+        code => Ok(code.into()),
+    }
+}
+
+async fn add_machine(name: MachineId, address: String) -> anyhow::Result<()> {
+    let origin = TailnetOrigin::parse(&address)?;
+    match Config::load()?.add_machine(&name, &origin)? {
+        Added::AlreadyThere => println!("{name} is already at {origin}."),
+        Added::New => {
+            println!("Added {name} at {origin}.");
+            if stop_running().await? {
+                println!("Stopped the running daemon; the next `seirei` starts one that reaches {name}.");
+            }
+        }
+    }
+    if Config::load()?.machine(&name)?.token.is_none() {
+        println!("Pair with it next: `seirei login {name}`.");
+    }
+    Ok(())
+}
+
+async fn remove_machine(name: MachineId) -> anyhow::Result<()> {
+    Config::load()?.remove_machine(&name)?;
+    println!("Removed {name}.");
+    if stop_running().await? {
+        println!("Stopped the running daemon; the next `seirei` starts one without {name}.");
+    }
+    Ok(())
+}
+
+async fn list_machines() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let listed = running_listing().await?;
+    let status = |id: &MachineId| match listed.as_ref().map(|listed| listed.iter().find(|l| &l.machine.id == id)) {
+        None => String::new(),
+        Some(None) => "not known to the running daemon".into(),
+        Some(Some(MachineProjects { machine, projects })) => match (&machine.status, &machine.label) {
+            (MachineStatus::Connected, Some(label)) => format!("connected to {label}, {} projects", projects.len()),
+            _ => machine.status_text(),
+        },
+    };
+    let rows: Vec<[String; 3]> = (config.machines.iter())
+        .map(|machine| [machine.id.to_string(), machine.endpoint.address(), status(&machine.id)])
+        .collect();
+    let width = |column: usize| rows.iter().map(|row| row[column].len()).max().unwrap_or(0);
+    let (names, addresses) = (width(0), width(1));
+    for [id, address, status] in &rows {
+        println!("{}", format!("{id:names$}  {address:addresses$}  {status}").trim_end());
+    }
+    if listed.is_none() {
+        println!("No daemon is running, so no status. `seirei status` starts one.");
+    }
+    Ok(())
+}
+
+/// The running daemon's view of every machine, without starting a daemon.
+async fn running_listing() -> anyhow::Result<Option<Vec<MachineProjects>>> {
+    let Some(mut client) = Client::connect().await? else { return Ok(None) };
+    if client.hello(false).await? != ServerMsg::Welcome {
+        return Ok(None);
+    }
+    match client.call(Command::ListProjects).await? {
+        Reply::Projects(listed) => Ok(Some(listed)),
+        Reply::Done => bail!("ListProjects answered without projects"),
+    }
 }
 
 async fn status(project: Option<String>) -> anyhow::Result<()> {
@@ -263,14 +380,16 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn login_takes_access_by_name_and_defaults_to_full_access() {
+    fn login_defaults_to_local_at_full_access() {
         Cli::command().debug_assert();
-        let access = |args: &[&str]| match Cli::try_parse_from(args).map(|cli| cli.command) {
-            Ok(Some(Cmd::Login { access, .. })) => Some(access),
+        let login = |args: &[&str]| match Cli::try_parse_from(args).map(|cli| cli.command) {
+            Ok(Some(Cmd::Login { machine, access, .. })) => Some((machine.to_string(), access)),
             _ => None,
         };
-        assert_eq!(access(&["seirei", "login", "--access", "auto"]), Some(Access::Auto));
-        assert_eq!(access(&["seirei", "login"]), Some(Access::FullAccess));
-        assert_eq!(access(&["seirei", "login", "--access", "root"]), None);
+        assert_eq!(login(&["seirei", "login", "--access", "auto"]), Some(("local".into(), Access::Auto)));
+        assert_eq!(login(&["seirei", "login"]), Some(("local".into(), Access::FullAccess)));
+        assert_eq!(login(&["seirei", "login", "macbook"]), Some(("macbook".into(), Access::FullAccess)));
+        assert_eq!(login(&["seirei", "login", "--access", "root"]), None);
+        assert_eq!(login(&["seirei", "login", "MacBook"]), None, "a machine name is parsed");
     }
 }

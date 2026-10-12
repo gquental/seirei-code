@@ -8,6 +8,9 @@ A background daemon owns the connection to T3 and the synced state. TUI clients 
 
 ```
 $ seirei login               # once: pair with T3, save a 30-day credential
+$ seirei machine add macbook https://macbook.tail1234.ts.net:4043   # a T3 on another machine, over Tailscale
+$ seirei login macbook       # pair with it, using a code made on that machine
+$ seirei machine list        # every machine, its address, and whether the daemon reaches it
 $ seirei                     # attach (starting the daemon if needed) and open the project picker
 $ seirei seirei-code         # straight to one project's pane; `<machine>/seirei-code` when the title is on several machines
 $ seirei status seirei-code  # the same pane as JSON, for scripts and debugging
@@ -19,7 +22,7 @@ In a project pane, `c` creates the coordinator when the project has none. `i` op
 
 ## What T3 gives us
 
-Seirei talks to T3's MCP server over streamable HTTP. The origin comes from `<T3CODE_HOME or ~/.t3>/userdata/server-runtime.json`. A few behaviors of that server shape everything below. They were read out of the running server's source, not guessed.
+Seirei talks to T3's MCP server over streamable HTTP. The local origin comes from `<T3CODE_HOME or ~/.t3>/userdata/server-runtime.json`, and other machines' origins from `machines.toml`. A few behaviors of that server shape everything below. They were read out of the running server's source, not guessed.
 
 - **T3 pushes nothing.** The server has tools only. No resources, no subscriptions. Seirei polls and diffs.
 - **`t3_thread_list` is ordered by `updatedAt`, newest first, and every timeline event bumps `updatedAt`.** One page per tick shows everything that changed since the last tick, even in a project with 1,900 threads.
@@ -56,7 +59,7 @@ Each watched project has one actor task, the only writer of that project's state
 
 Actors publish through `watch` channels. Each project has one `Arc<ProjectView>`, and each open timeline has one `Arc<Timeline>`. A slow reader skips to the latest value. Interest is channel liveness. A timeline stays hot exactly as long as some session holds its receiver, and the view's receiver count picks the polling cadence.
 
-The only durable state is `<state_dir>/machines/<machine>/projects/<project>.json`, holding the coordinator binding. Everything else is rebuilt from T3 after a restart.
+The durable state is the coordinator binding in `<state_dir>/machines/<machine>/projects/<project>.json` and each machine's T3 identity in `<state_dir>/machines/<machine>/identity.json`. Everything else is rebuilt from T3 after a restart.
 
 ## Machines
 
@@ -65,6 +68,16 @@ A machine is one T3 server. `local` is the T3 on this machine, found through `se
 Each machine has its own `T3Api`, credential, and state folder. Nothing is shared between machines. `seirei login` saves the credential to `<config_dir>/credentials/<machine>.json`. A token from `$SEIREI_T3_TOKEN` or `t3_token` applies to `local` only.
 
 `ListProjects` asks every machine at once and waits at most 5 s for each. A machine that fails lists no projects and reports why: `NeedsLogin` for a missing, lapsed, or rejected credential, `Unreachable` when T3 does not answer, and `Failed` when it answers with something other than its projects. One machine never fails the whole call. A call goes out even without a credential, so a T3 that is down reads as unreachable rather than as a missing login.
+
+Other machines live in `<config_dir>/machines.toml`, one table per machine with its `address` and an optional `coordinator_model`. `seirei machine add` and `remove` rewrite the whole file and restart a running daemon, the way `seirei login` does. A user may edit the file by hand. `local` is implicit and cannot be added or removed. Its `coordinator_model` stays in `config.toml`.
+
+For now seirei reaches other machines only over Tailscale. A `config::TailnetOrigin` is built only by its parse function, which accepts `https` with a host under `.ts.net` or a Tailscale IP, an optional port, and no path but `/mcp`. It keeps the bare origin. Tailscale Serve uses real certificates, so reqwest's rustls verifies them against the system's roots. The local T3 stays plain HTTP on loopback.
+
+A pairing code for a remote T3 has to be made on that machine, because seirei can only run the local `t3`. Without `--code`, `seirei login <machine>` asks for one on a terminal and fails without one. The OAuth flow then runs against that machine's origin.
+
+Neither an address nor a host identifies a T3. Two addresses can reach one T3, and one host can run two. A T3's identity is its `environmentId`. Every listing that reaches a machine reads it with `t3_environment_read`, and the daemon records it in the machine's `identity.json`. It reloads those files at start. Of the machines that share an `environmentId`, the first in `MachineId` order (`local`, then by name) owns that T3. Every other one is `Duplicate` of the owner, whether or not the owner answers right now. A duplicate lists no projects, starts no project actors, and refuses commands with a reply that names the owner. So one T3 never gets a second coordinator for a project under another name.
+
+When a machine reads a different `environmentId` than its record, its address now reaches another T3. The daemon replaces the record and drops that machine's project records and actors, because their coordinator bindings name the old server's threads. The machine reports `Replaced` with the old and new T3 until the daemon restarts.
 
 A bare project title that more than one machine lists is ambiguous. `seirei` and `seirei status` then ask for `<machine>/<project>`.
 
@@ -119,7 +132,7 @@ The coordinator launches at the credential's ceiling. A coordinator above the ce
 
 `coordinator::launch_model` picks the coordinator's model, first match wins:
 
-1. `coordinator_model` from the config file, written `<providerInstanceId>/<model>`.
+1. The machine's `coordinator_model`, from `config.toml` for `local` and from `machines.toml` for the others, written `<providerInstanceId>/<model>`.
 2. The project's default model. Seirei passes no `modelSelection`, and T3 applies the default.
 3. The model of the project's newest thread, the first row of `t3_thread_list`.
 4. The first model `orchestrator_capabilities` offers from a provider without constraints.

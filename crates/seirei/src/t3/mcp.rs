@@ -1,5 +1,5 @@
-use super::{Launch, PageSize, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage, wire};
-use crate::config::Token;
+use super::{Environment, Launch, PageSize, ReadQuery, T3Api, T3Error, ThreadPage, TimelinePage, wire};
+use crate::config::{Endpoint, Token};
 use seirei_proto::{
     ids::{ProjectId, RequestId, SendId, ThreadId},
     model::{Access, Answers, ModelSelection, PendingRequest, Project, ThreadSummary},
@@ -7,7 +7,7 @@ use seirei_proto::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -17,7 +17,7 @@ const SESSION_HEADER: &str = "mcp-session-id";
 
 pub struct McpT3 {
     http: reqwest::Client,
-    t3_home: PathBuf,
+    endpoint: Endpoint,
     /// A 401 is reported as `Unauthorized`, never retried: only `seirei login` mints a token,
     /// because a CLI-issued session is capped at `approval-required`. Without a token, calls still
     /// go out, so a T3 that is down reads as unreachable rather than as a missing login.
@@ -52,13 +52,13 @@ pub fn origin(t3_home: &Path) -> Result<String, T3Error> {
 }
 
 impl McpT3 {
-    pub fn new(t3_home: PathBuf, token: Option<Token>) -> Self {
+    pub fn new(endpoint: Endpoint, token: Option<Token>) -> Self {
         let http = (reqwest::Client::builder())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
             .build()
-            .expect("a client without TLS or proxies always builds");
-        Self { http, t3_home, token, session: Default::default(), next_id: AtomicU64::new(1) }
+            .expect("a client with the built-in TLS and no proxies always builds");
+        Self { http, endpoint, token, session: Default::default(), next_id: AtomicU64::new(1) }
     }
 
     /// Null arguments are dropped: T3's validators reject an explicit `null` for an optional
@@ -96,7 +96,7 @@ impl McpT3 {
     }
 
     async fn connect(&self) -> Result<Session, T3Error> {
-        let endpoint = format!("{}/mcp", origin(&self.t3_home)?);
+        let endpoint = format!("{}/mcp", self.endpoint.origin()?);
         let hello = json!({
             "protocolVersion": PROTOCOL,
             "capabilities": {},
@@ -132,12 +132,12 @@ impl McpT3 {
             request = request.header(SESSION_HEADER, id).header("mcp-protocol-version", PROTOCOL);
         }
         let response = request.send().await.map_err(|e| {
-            let detail = format!("{endpoint}: {e}");
+            let detail = format!("{endpoint}: {}", causes(&e));
             if e.is_connect() { T3Error::Unreachable(detail) } else { T3Error::Lost(detail) }
         })?;
         let status = response.status();
         let header = response.headers().get(SESSION_HEADER).and_then(|v| v.to_str().ok()).map(String::from);
-        let bytes = response.bytes().await.map_err(|e| T3Error::Lost(format!("{endpoint}: {e}")))?;
+        let bytes = response.bytes().await.map_err(|e| T3Error::Lost(format!("{endpoint}: {}", causes(&e))))?;
         let text = || String::from_utf8_lossy(&bytes).into_owned();
         match status.as_u16() {
             401 => Err(T3Error::Unauthorized),
@@ -150,6 +150,17 @@ impl McpT3 {
             _ => Err(T3Error::Lost(format!("HTTP {status}: {}", text()))),
         }
     }
+}
+
+/// reqwest's own message only repeats the URL; the reason (DNS, refused, TLS) is in its sources.
+fn causes(e: &reqwest::Error) -> String {
+    let mut reasons = Vec::new();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        reasons.push(cause.to_string());
+        source = cause.source();
+    }
+    if reasons.is_empty() { e.to_string() } else { reasons.join(": ") }
 }
 
 /// T3 reports a tool failure as `isError: true` with a text block holding `{"_tag","code","message"}`;
@@ -179,7 +190,11 @@ impl T3Api for McpT3 {
     }
 
     fn address(&self) -> String {
-        origin(&self.t3_home).unwrap_or_else(|_| self.t3_home.display().to_string())
+        self.endpoint.address()
+    }
+
+    async fn environment(&self) -> Result<Environment, T3Error> {
+        wire::parse(self.call("t3_environment_read", json!({})).await?)
     }
 
     async fn projects(&self) -> Result<Vec<Project>, T3Error> {
@@ -314,7 +329,8 @@ mod tests {
             }
         });
         let token = Token { secret: Secret("stub".into()), access: None };
-        Stub { t3: McpT3::new(t3_home.path().to_path_buf(), Some(token)), methods, t3_home }
+        let endpoint = Endpoint::Local { t3_home: t3_home.path().to_path_buf() };
+        Stub { t3: McpT3::new(endpoint, Some(token)), methods, t3_home }
     }
 
     async fn exchange(mut stream: TcpStream, respond: Respond, seen: Arc<Mutex<Vec<String>>>) {
@@ -363,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn without_a_token_a_running_t3_needs_a_login_and_a_stopped_one_is_unreachable() {
         let stub = stub(|_| (401, None, r#"{"error":"invalid_mcp_credential"}"#.into())).await;
-        let anonymous = McpT3::new(stub.t3_home.path().to_path_buf(), None);
+        let anonymous = McpT3::new(Endpoint::Local { t3_home: stub.t3_home.path().to_path_buf() }, None);
         let refused = anonymous.projects().await.expect_err("T3 wants a credential");
         assert!(
             matches!(refused, T3Error::NoSession(ref cause) if matches!(**cause, T3Error::Unauthorized)),
@@ -432,7 +448,7 @@ mod tests {
     async fn live_scan_and_tail_read_parse() {
         let config = crate::config::Config::load().expect("the config loads");
         let local = config.machine(&seirei_proto::ids::MachineId::local()).expect("local is always configured");
-        let t3 = McpT3::new(local.t3_home.clone(), local.token.clone());
+        let t3 = McpT3::new(local.endpoint.clone(), local.token.clone());
         let mut busiest: Option<ThreadSummary> = None;
         for project in t3.projects().await.expect("projects list") {
             let (mut rows, mut unparsed, mut pages, mut cursor) = (0, Vec::new(), 0, None);

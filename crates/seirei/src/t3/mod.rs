@@ -19,6 +19,9 @@ pub trait T3Api: Send + Sync + 'static {
     /// Where this T3 is reached, for display.
     fn address(&self) -> String;
 
+    /// T3's own identity. Two addresses can reach one T3, and one host can run two T3s.
+    fn environment(&self) -> impl Future<Output = Result<Environment, T3Error>> + Send;
+
     fn projects(&self) -> impl Future<Output = Result<Vec<Project>, T3Error>> + Send;
 
     fn models(&self) -> impl Future<Output = Result<Vec<ModelSelection>, T3Error>> + Send;
@@ -97,6 +100,13 @@ pub struct TimelinePage {
     pub earlier: u64,
     pub has_more: bool,
     pub unparsed: BTreeMap<ItemId, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Environment {
+    pub environment_id: String,
+    pub label: String,
 }
 
 pub struct Launch {

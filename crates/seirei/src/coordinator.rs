@@ -80,6 +80,13 @@ impl ProjectRecord {
         Ok(projects)
     }
 
+    pub fn forget_all(state_dir: &Path) -> io::Result<()> {
+        match std::fs::remove_dir_all(state_dir.join("projects")) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     fn path(state_dir: &Path, project: &ProjectId) -> PathBuf {
         state_dir.join("projects").join(format!("{}.json", project.as_str()))
     }

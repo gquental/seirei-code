@@ -91,7 +91,7 @@ pub fn new_app(open: Option<&str>) -> App {
 pub fn app_in_project(view: ProjectView) -> App {
     let mut app = new_app(None);
     app.update(Event::Server(ServerMsg::Welcome));
-    let projects = local(vec![view.project.clone()]);
+    let projects = vec![machine(view.machine.as_str(), MachineStatus::Connected, vec![view.project.clone()])];
     app.update(Event::Server(ServerMsg::Reply { id: CallId(1), result: Ok(Reply::Projects(projects)) }));
     app.update(Event::Key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter)));
     app.update(Event::Server(ServerMsg::Project(Arc::new(view))));

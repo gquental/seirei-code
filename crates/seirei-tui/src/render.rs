@@ -11,7 +11,10 @@ use ratatui::{
 };
 use seirei_proto::{
     ids::ThreadId,
-    model::{Access, CoordinatorView, JobLink, PendingRequest, Problem, ProjectView, ThreadStatus, ThreadSummary},
+    model::{
+        Access, CoordinatorView, JobLink, PendingRequest, Problem, ProjectView, ThreadStatus, ThreadSummary,
+        login_command,
+    },
     timeline::{Item, ItemKind, ItemStatus, Timeline},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -87,13 +90,15 @@ fn alerts(app: &App) -> Vec<Line<'static>> {
             Color::Red,
         )),
     }
-    let problem = match &app.screen {
-        Screen::Project(p) => p.view.as_deref().and_then(|v| v.health.problem.as_ref()),
+    let view = match &app.screen {
+        Screen::Project(p) => p.view.as_deref(),
         Screen::Picker { .. } => None,
     };
-    if let Some(problem) = problem {
+    if let Some((view, problem)) = view.and_then(|v| Some((v, v.health.problem.as_ref()?))) {
         let hint = match problem {
-            Problem::Unauthorized => "T3 rejected seirei's credential. Run `seirei login` to pair again.".into(),
+            Problem::Unauthorized => {
+                format!("T3 rejected seirei's credential. Run `{}` to pair again.", login_command(&view.machine))
+            }
             Problem::Unreachable { detail } => {
                 format!("T3 is unreachable ({detail}). Start T3 Code; seirei catches up on its own.")
             }
@@ -307,10 +312,10 @@ fn questions_strip(view: &ProjectView) -> Vec<Line<'static>> {
 
 fn grant_line(view: &ProjectView, shortfall: &Shortfall) -> Line<'static> {
     let text = match shortfall {
-        Shortfall::Launch => {
-            "This login is read-only, so it cannot create a coordinator. Run `seirei login --access full-access`."
-                .to_string()
-        }
+        Shortfall::Launch => format!(
+            "This login is read-only, so it cannot create a coordinator. Run `{} --access full-access`.",
+            login_command(&view.machine)
+        ),
         Shortfall::Thread { thread, mode, access } => {
             let who = match &view.coordinator {
                 CoordinatorView::Ready(c) if &c.id == thread => "The coordinator".to_string(),
@@ -321,7 +326,7 @@ fn grant_line(view: &ProjectView, shortfall: &Shortfall) -> Line<'static> {
                 access => format!("this login allows {}", access.name()),
             };
             let needed = Access::from(*mode).name();
-            format!("{who} runs at {needed}; {grant}. Run `seirei login --access {needed}`.")
+            format!("{who} runs at {needed}; {grant}. Run `{} --access {needed}`.", login_command(&view.machine))
         }
     };
     Line::styled(format!(" ⚠ {text}"), Color::Yellow)
@@ -662,7 +667,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent};
     use ratatui::{Terminal, backend::TestBackend};
     use seirei_proto::{
-        ids::{ItemId, T3Time},
+        ids::{ItemId, MachineId, T3Time},
         model::Health,
         timeline::ItemText,
         wire::{BuildId, CallId, Reply, ServerMsg},
@@ -772,6 +777,19 @@ mod tests {
         let shown = screen(&app, 140, 20);
         assert!(shown.contains("Run `seirei login`"), "{shown}");
         assert!(shown.contains("✗ sync failing"), "{shown}");
+    }
+
+    #[test]
+    fn a_rejected_credential_names_the_login_of_its_machine() {
+        let mut view = pane_view();
+        view.machine = MachineId::parse("macbook").unwrap();
+        view.health = Health { last_sync: None, problem: Some(Problem::Unauthorized) };
+        let shown = screen(&app_in_project(view.clone()), 140, 20);
+        assert!(shown.contains("Run `seirei login macbook` to pair again."), "{shown}");
+        view.health.problem = None;
+        view.access = Some(Access::Auto);
+        let shown = screen(&app_in_project(view), 140, 40);
+        assert!(shown.contains("Run `seirei login macbook --access full-access`."), "{shown}");
     }
 
     #[test]
