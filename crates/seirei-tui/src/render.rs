@@ -1,5 +1,8 @@
 use crate::{
-    app::{AnswerForm, App, DraftState, Focus, Link, Mode, ProjectScreen, Row, Screen, Shortfall},
+    app::{
+        AnswerForm, App, DraftState, Field, Focus, FormKind, FormState, Link, MachineForm, Mode, ProjectScreen, Row,
+        Screen, Shortfall,
+    },
     keymap::{self, Context},
 };
 use ratatui::{
@@ -12,8 +15,8 @@ use ratatui::{
 use seirei_proto::{
     ids::ThreadId,
     model::{
-        Access, CoordinatorView, JobLink, Machine, MachineStatus, PendingRequest, Problem, ProjectView, ThreadStatus,
-        ThreadSummary, login_command,
+        Access, CoordinatorView, JobLink, Machine, MachineStatus, PAIRING_HINT, PendingRequest, Problem, ProjectView,
+        ThreadStatus, ThreadSummary, login_command,
     },
     timeline::{Item, ItemKind, ItemStatus, Timeline},
 };
@@ -35,7 +38,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     title_bar(app, frame, top);
     frame.render_widget(Paragraph::new(alerts), alert_area);
     match &app.screen {
-        Screen::Picker { cursor } => picker(app, *cursor, frame, body),
+        Screen::Picker { cursor, .. } => picker(app, *cursor, frame, body),
         Screen::Project(p) => project(p, app.shortfall(), frame, body),
     }
     if let Some(notice) = &app.notice {
@@ -50,7 +53,8 @@ pub fn render(app: &App, frame: &mut Frame) {
             Mode::Answer(_) => answer_form(p, frame),
             Mode::Browse | Mode::Compose => {}
         },
-        (_, Screen::Picker { .. }) => {}
+        (_, Screen::Picker { form: Some(form), .. }) => machine_form(form, frame),
+        (_, Screen::Picker { form: None, .. }) => {}
     }
 }
 
@@ -128,31 +132,29 @@ fn picker(app: &App, cursor: usize, frame: &mut Frame, area: Rect) {
         return;
     }
     let title_width = app.listed().map(|(_, p)| p.title.width()).max().unwrap_or(0);
-    let (mut rows, mut selected, mut index) = (Vec::new(), None, 0);
+    let mut rows = Vec::new();
     for listed in &app.projects {
-        rows.push(ListItem::new(machine_heading(&listed.machine, listed.projects.is_empty(), inner.width)));
+        let here = rows.len() == cursor;
+        rows.push(ListItem::new(machine_heading(&listed.machine, listed.projects.is_empty(), here, inner.width)));
         for project in &listed.projects {
-            let here = index == cursor;
-            if here {
-                selected = Some(rows.len());
-            }
+            let here = rows.len() == cursor;
             let pad = " ".repeat(title_width - project.title.width());
             rows.push(ListItem::new(Line::from(vec![
                 Span::raw(format!("{}{}{pad}   ", if here { "  › " } else { "    " }, project.title)),
                 Span::styled(project.root.display().to_string(), dim()),
             ])));
-            index += 1;
         }
     }
     let list = List::new(rows).highlight_style(Style::new().fg(Color::Cyan).bold());
-    let mut state = ListState::default().with_selected(selected);
+    let mut state = ListState::default().with_selected(Some(cursor));
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-fn machine_heading(machine: &Machine, empty: bool, width: u16) -> Line<'static> {
+fn machine_heading(machine: &Machine, empty: bool, here: bool, width: u16) -> Line<'static> {
+    let marker = if here { "› " } else { "  " };
     let name = match &machine.label {
-        Some(label) if label != machine.id.as_str() => format!("  {} ({label})", machine.id),
-        _ => format!("  {}", machine.id),
+        Some(label) if label != machine.id.as_str() => format!("{marker}{} ({label})", machine.id),
+        _ => format!("{marker}{}", machine.id),
     };
     let (glyph, color) = match &machine.status {
         MachineStatus::Connected => ("✓", Color::Green),
@@ -490,6 +492,72 @@ fn answer_form(p: &ProjectScreen, frame: &mut Frame) {
     }
 }
 
+fn machine_form(form: &MachineForm, frame: &mut Frame) {
+    let width = frame.area().width.saturating_sub(4).min(76);
+    let text_width = usize::from(width.saturating_sub(4));
+    let note = |text: &str, style: Style| wrap(text, text_width).into_iter().map(move |l| Line::styled(l, style));
+    let (mut lines, mut cursor) = (Vec::new(), None);
+    let mut field = |lines: &mut Vec<Line>, label: &str, value: &str, here: bool| {
+        let marker = if here { "› " } else { "  " };
+        let label = format!("{marker}{label:<12}  ");
+        let shown = truncate(value, text_width.saturating_sub(label.width() + 1));
+        if here {
+            cursor = Some((lines.len() as u16, (label.width() + shown.width()) as u16));
+        }
+        let style = if here { Style::new().fg(Color::Cyan).bold() } else { Style::new() };
+        lines.push(Line::from(vec![Span::styled(label, style), Span::raw(shown)]));
+    };
+    let (title, working) = match &form.kind {
+        FormKind::Add { name, address, field: at } => {
+            field(&mut lines, "Name", name, *at == Field::Name);
+            field(&mut lines, "Address", address, *at == Field::Address);
+            lines.push(Line::default());
+            let hint = "A T3 served on your tailnet. Give its address as https://<machine>.<tailnet>.ts.net, \
+                        with its port when it is not 443.";
+            lines.extend(note(hint, dim()));
+            (" Add a machine ".to_owned(), "Adding…")
+        }
+        FormKind::Login { machine, code, access } => {
+            match code {
+                Some(code) => {
+                    field(&mut lines, "Pairing code", code, true);
+                    lines.extend(note(&format!("{PAIRING_HINT}."), dim()));
+                }
+                None => lines.extend(note("Enter pairs with the T3 on this machine. Seirei makes the code.", dim())),
+            }
+            lines.push(Line::default());
+            let lower = if *access == Access::ALL[0] { "  " } else { "‹ " };
+            let higher = if *access == Access::ALL[Access::ALL.len() - 1] { "" } else { " ›" };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {:<12}  {lower}", "Access")),
+                Span::styled(access.name(), Modifier::BOLD),
+                Span::raw(higher),
+            ]));
+            (format!(" Log in to {machine} "), "Logging in…")
+        }
+        FormKind::Remove { machine } => {
+            lines.push(Line::raw(format!("Remove {machine}? y/n")));
+            lines.push(Line::default());
+            let hint = "Seirei stops syncing its projects. Its credential and records stay, so adding it back \
+                        picks up its coordinators again.";
+            lines.extend(note(hint, dim()));
+            (" Remove a machine ".to_owned(), "Removing…")
+        }
+    };
+    match &form.state {
+        FormState::Editing => {}
+        FormState::Working(_) => lines.extend([Line::default(), Line::styled(working, Color::Yellow)]),
+        FormState::Failed(why) => {
+            lines.push(Line::default());
+            lines.extend(note(why, Style::new().fg(Color::Red)));
+        }
+    }
+    let area = overlay(frame, &title, width, lines);
+    if let Some((row, col)) = cursor {
+        frame.set_cursor_position(Position::new(area.x + 2 + col, area.y + 1 + row));
+    }
+}
+
 fn overlay(frame: &mut Frame, title: &str, width: u16, lines: Vec<Line>) -> Rect {
     let screen = frame.area();
     let height = (lines.len() as u16 + 2).min(screen.height);
@@ -704,7 +772,7 @@ mod tests {
         ids::{ItemId, MachineId, ProjectId, ProjectRef, T3Time},
         model::Health,
         timeline::ItemText,
-        wire::{BuildId, CallId, Reply, ServerMsg},
+        wire::{BuildId, CallError, CallId, Reply, ServerMsg},
     };
     use std::sync::Arc;
 
@@ -814,11 +882,14 @@ mod tests {
             "{shown}"
         );
 
-        for _ in 0..4 {
-            press(&mut app, KeyCode::Char('j'));
-        }
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
         let shown = screen(&app, 100, 20);
-        assert!(shown.contains("  › photos"), "the cursor skips headings and stops at the last project\n{shown}");
+        assert!(shown.contains("› box  ✓ connected"), "the cursor rests on a heading too\n{shown}");
+        assert!(!shown.contains("open project"), "Enter opens nothing on a heading\n{shown}");
+        press(&mut app, KeyCode::Char('j'));
+        let shown = screen(&app, 100, 20);
+        assert!(shown.contains("  › photos"), "{shown}");
         assert_eq!(shown.matches('›').count(), 1, "{shown}");
         press(&mut app, KeyCode::Enter);
         let at = ProjectRef { machine: MachineId::parse("box").unwrap(), project: ProjectId::new("c") };
@@ -856,8 +927,81 @@ mod tests {
         app.update(Event::Server(ServerMsg::Reply { id: CallId(1), result: Ok(Reply::Projects(listing)) }));
         let rows = screen(&app, 60, 10);
         let heading = rows_after(&rows, "Projects")[0].to_owned();
-        assert!(heading.starts_with("  ghost  ✗ unreachable: https://ghost") && heading.ends_with('…'), "{rows}");
+        assert!(heading.starts_with("› ghost  ✗ unreachable: https://ghost") && heading.ends_with('…'), "{rows}");
         assert!(heading.width() <= 60, "{rows}");
+    }
+
+    fn machines_app() -> App {
+        let mut app = new_app(None);
+        app.update(Event::Server(ServerMsg::Welcome));
+        let listing = vec![
+            machine("local", MachineStatus::Connected, vec![project_meta("a", "alpha")]),
+            machine("studio", MachineStatus::NeedsLogin, vec![]),
+            machine("twin", MachineStatus::Duplicate { of: MachineId::local() }, vec![]),
+        ];
+        app.update(Event::Server(ServerMsg::Reply { id: CallId(1), result: Ok(Reply::Projects(listing)) }));
+        app
+    }
+
+    #[test]
+    fn the_footer_offers_login_on_a_heading_and_removal_off_local() {
+        let mut app = machines_app();
+        let footer = |app: &App| {
+            let shown = screen(app, 140, 12);
+            let row = shown.lines().last().unwrap_or_default().to_owned();
+            ["enter open project", "m add a machine", "l log in", "x remove machine"].map(|hint| row.contains(hint))
+        };
+        assert_eq!(footer(&app), [true, true, false, false], "on a project");
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(footer(&app), [false, true, true, false], "on local");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(footer(&app), [false, true, true, true], "on another machine");
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(footer(&app), [false, true, false, true], "on a duplicate");
+    }
+
+    #[test]
+    fn the_machine_forms_say_what_they_need_and_how_they_went() {
+        let mut app = machines_app();
+        press(&mut app, KeyCode::Char('m'));
+        for c in "mini".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let shown = screen(&app, 140, 30);
+        for expected in ["Add a machine", "› Name          mini", "  Address", "tab next field", "esc cancel"] {
+            assert!(shown.contains(expected), "missing {expected:?} in\n{shown}");
+        }
+        app.update(Event::Key(KeyEvent::from(KeyCode::Esc)));
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('l'));
+        let shown = screen(&app, 140, 30);
+        for expected in ["Log in to studio", "› Pairing code", "create a pairing code", "‹ full-access"] {
+            assert!(shown.contains(expected), "missing {expected:?} in\n{shown}");
+        }
+        assert!(shown.contains("← less access") && !shown.contains("more access"), "full-access is the top\n{shown}");
+        press(&mut app, KeyCode::Char('A'));
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&app, 140, 30).contains("Logging in…"));
+        let refused = CallError { message: "T3 refused the login: pairing code expired".into(), retry_safe: true };
+        app.update(Event::Server(ServerMsg::Reply { id: CallId(2), result: Err(refused) }));
+        let shown = screen(&app, 140, 30);
+        assert!(shown.contains("pairing code expired") && shown.contains("Pairing code  A"), "{shown}");
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('l'));
+        let shown = screen(&app, 140, 30);
+        assert!(shown.contains("Seirei makes the code") && !shown.contains("Pairing code"), "{shown}");
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('x'));
+        let shown = screen(&app, 140, 30);
+        assert!(shown.contains("Remove studio? y/n") && shown.contains("y remove"), "{shown}");
     }
 
     #[test]

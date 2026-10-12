@@ -68,11 +68,21 @@ seirei login macbook
 
 Seirei asks for a pairing code. The code has to come from that machine, so create one in its T3, or run `t3 auth pairing create --ttl 10m` there. In a script, pass the code with `--code` instead. The credential lasts 30 days, like the local one.
 
+You can also add a machine, log in to it, and remove it from the picker. See [Keys](#keys).
+
 `seirei machine list` shows each machine and whether the daemon reaches it. A project title that is on two machines needs its machine, as in `seirei macbook/seirei-code`. When two names reach the same T3, seirei lists its projects once. They go under `local`, or else under the name that sorts first, even while that machine is down.
 
 ## Keys
 
-The picker lists projects under one line per machine. That line says whether seirei reaches the machine, and what to run when it does not. `j` and `k` move between projects, `Enter` opens one, and `q` quits.
+The picker lists projects under one line per machine. That line says whether seirei reaches the machine, and what to run when it does not. `j` and `k` move between machines and projects, `Enter` opens a project, and `q` quits.
+
+| Key | Action |
+| --- | --- |
+| `m` | Add a machine. `Tab` moves between its name and address, and `Enter` adds it. |
+| `l` | On a machine's line, log in to it. Another machine needs a pairing code made there. `local` needs none, because seirei makes one. `←` and `→` change the access level, which starts at `full-access`. |
+| `x` | On a machine's line, remove it. `local` cannot be removed. |
+
+`Esc` closes these forms. When the daemon refuses a change, the form stays open with what you typed and shows why.
 
 In a project pane:
 
