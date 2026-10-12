@@ -1,5 +1,6 @@
 pub mod config;
 pub mod coordinator;
+pub mod project;
 pub mod t3;
 
 use std::{
