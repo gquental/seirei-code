@@ -12,8 +12,8 @@ use ratatui::{
 use seirei_proto::{
     ids::ThreadId,
     model::{
-        Access, CoordinatorView, JobLink, PendingRequest, Problem, ProjectView, ThreadStatus, ThreadSummary,
-        login_command,
+        Access, CoordinatorView, JobLink, Machine, MachineStatus, PendingRequest, Problem, ProjectView, ThreadStatus,
+        ThreadSummary, login_command,
     },
     timeline::{Item, ItemKind, ItemStatus, Timeline},
 };
@@ -62,6 +62,9 @@ fn title_bar(app: &App, frame: &mut Frame, area: Rect) {
         let title = (p.view.as_deref().map(|v| v.project.title.as_str()).filter(|title| !title.is_empty()))
             .or_else(|| listed().map(|(_, project)| project.title.as_str()))
             .unwrap_or(p.id.project.as_str());
+        if app.projects.iter().any(|listed| !listed.machine.id.is_local()) {
+            crumbs.push(Span::raw(format!(" › {}", p.id.machine)));
+        }
         crumbs.push(Span::raw(format!(" › {title}")));
         if let Focus::Job { thread, .. } = &p.focus {
             crumbs.push(Span::raw(format!(" › {}", thread_title(p.view.as_deref(), thread))));
@@ -116,26 +119,57 @@ fn picker(app: &App, cursor: usize, frame: &mut Frame, area: Rect) {
     let block = Block::new().title(Line::styled("  Projects", Modifier::BOLD)).padding(Padding::top(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if app.listed().next().is_none() {
+    if app.projects.is_empty() {
         let message = match app.link {
-            Link::Up if app.loading_projects() => "Loading projects…",
-            Link::Up => "T3 has no projects yet. Add one in T3 Code.",
+            Link::Up => "Loading projects…",
             _ => "Waiting for the daemon…",
         };
         frame.render_widget(Line::styled(format!("  {message}"), dim()), inner);
         return;
     }
     let title_width = app.listed().map(|(_, p)| p.title.width()).max().unwrap_or(0);
-    let rows = app.listed().map(|(_, p)| {
-        let pad = " ".repeat(title_width - p.title.width());
-        ListItem::new(Line::from(vec![
-            Span::raw(format!("{}{pad}   ", p.title)),
-            Span::styled(p.root.display().to_string(), dim()),
-        ]))
-    });
-    let list = List::new(rows).highlight_symbol("  › ").highlight_style(Style::new().fg(Color::Cyan).bold());
-    let mut state = ListState::default().with_selected(Some(cursor));
-    frame.render_stateful_widget(list.repeat_highlight_symbol(false), inner, &mut state);
+    let (mut rows, mut selected, mut index) = (Vec::new(), None, 0);
+    for listed in &app.projects {
+        rows.push(ListItem::new(machine_heading(&listed.machine, listed.projects.is_empty(), inner.width)));
+        for project in &listed.projects {
+            let here = index == cursor;
+            if here {
+                selected = Some(rows.len());
+            }
+            let pad = " ".repeat(title_width - project.title.width());
+            rows.push(ListItem::new(Line::from(vec![
+                Span::raw(format!("{}{}{pad}   ", if here { "  › " } else { "    " }, project.title)),
+                Span::styled(project.root.display().to_string(), dim()),
+            ])));
+            index += 1;
+        }
+    }
+    let list = List::new(rows).highlight_style(Style::new().fg(Color::Cyan).bold());
+    let mut state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(list, inner, &mut state);
+}
+
+fn machine_heading(machine: &Machine, empty: bool, width: u16) -> Line<'static> {
+    let name = match &machine.label {
+        Some(label) if label != machine.id.as_str() => format!("  {} ({label})", machine.id),
+        _ => format!("  {}", machine.id),
+    };
+    let (glyph, color) = match &machine.status {
+        MachineStatus::Connected => ("✓", Color::Green),
+        MachineStatus::NeedsLogin => ("!", Color::Yellow),
+        MachineStatus::Replaced { .. } => ("↻", Color::Yellow),
+        MachineStatus::Unreachable { .. } | MachineStatus::Failed { .. } => ("✗", Color::Red),
+        MachineStatus::Duplicate { .. } => ("=", Color::DarkGray),
+    };
+    let status = match &machine.status {
+        MachineStatus::Connected if empty => "connected, no projects yet".into(),
+        _ => machine.status_text(),
+    };
+    let room = usize::from(width).saturating_sub(name.width());
+    Line::from(vec![
+        Span::styled(name, Modifier::BOLD),
+        Span::styled(truncate(&format!("  {glyph} {status}"), room), color),
+    ])
 }
 
 fn project(p: &ProjectScreen, shortfall: Option<Shortfall>, frame: &mut Frame, area: Rect) {
@@ -667,7 +701,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent};
     use ratatui::{Terminal, backend::TestBackend};
     use seirei_proto::{
-        ids::{ItemId, MachineId, T3Time},
+        ids::{ItemId, MachineId, ProjectId, ProjectRef, T3Time},
         model::Health,
         timeline::ItemText,
         wire::{BuildId, CallId, Reply, ServerMsg},
@@ -736,6 +770,102 @@ mod tests {
         assert!(shown.contains("● daemon"), "{shown}");
         assert!(shown.contains("enter open project"), "{shown}");
         assert!(!shown.contains("Connecting"), "{shown}");
+    }
+
+    fn rows_after<'a>(shown: &'a str, title: &str) -> Vec<&'a str> {
+        shown.lines().skip_while(|row| !row.contains(title)).skip(2).take_while(|row| !row.is_empty()).collect()
+    }
+
+    #[test]
+    fn the_picker_groups_projects_by_machine_and_says_what_each_machine_needs() {
+        let mut app = new_app(None);
+        app.update(Event::Server(ServerMsg::Welcome));
+        let mut local = machine(
+            "local",
+            MachineStatus::Connected,
+            vec![project_meta("a", "alpha"), project_meta("b", "seirei-code")],
+        );
+        local.machine.label = Some("mac-studio".into());
+        let mut photos = machine("box", MachineStatus::Connected, vec![project_meta("c", "photos")]);
+        photos.machine.label = Some("box".into());
+        let listing = vec![
+            local,
+            photos,
+            machine("macbook", MachineStatus::NeedsLogin, vec![]),
+            machine("quiet", MachineStatus::Unreachable { detail: "connection refused".into() }, vec![]),
+            machine("studio", MachineStatus::Duplicate { of: MachineId::local() }, vec![]),
+            machine("spare", MachineStatus::Connected, vec![]),
+        ];
+        app.update(Event::Server(ServerMsg::Reply { id: CallId(1), result: Ok(Reply::Projects(listing)) }));
+        let shown = screen(&app, 100, 20);
+        assert_eq!(
+            rows_after(&shown, "Projects"),
+            [
+                "  local (mac-studio)  ✓ connected",
+                "  › alpha         /src/alpha",
+                "    seirei-code   /src/seirei-code",
+                "  box  ✓ connected",
+                "    photos        /src/photos",
+                "  macbook  ! needs login: run `seirei login macbook`",
+                "  quiet  ✗ unreachable: connection refused",
+                "  studio  = the same T3 as local, so its projects are listed there",
+                "  spare  ✓ connected, no projects yet",
+            ],
+            "{shown}"
+        );
+
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let shown = screen(&app, 100, 20);
+        assert!(shown.contains("  › photos"), "the cursor skips headings and stops at the last project\n{shown}");
+        assert_eq!(shown.matches('›').count(), 1, "{shown}");
+        press(&mut app, KeyCode::Enter);
+        let at = ProjectRef { machine: MachineId::parse("box").unwrap(), project: ProjectId::new("c") };
+        assert_eq!(app.subscription().project, Some(at));
+        assert!(screen(&app, 100, 20).contains("seirei › box › photos"), "the breadcrumb names the machine");
+    }
+
+    #[test]
+    fn a_machine_that_reaches_another_t3_says_so_above_its_projects() {
+        let mut app = new_app(None);
+        app.update(Event::Server(ServerMsg::Welcome));
+        let detail = "this address now reaches another T3, mini (env-2), not macbook (env-1); seirei forgot the \
+                      coordinators it knew there";
+        let listing = vec![machine(
+            "macbook",
+            MachineStatus::Replaced { detail: detail.into() },
+            vec![project_meta("a", "notes")],
+        )];
+        app.update(Event::Server(ServerMsg::Reply { id: CallId(1), result: Ok(Reply::Projects(listing)) }));
+        let shown = screen(&app, 160, 10);
+        assert_eq!(
+            rows_after(&shown, "Projects"),
+            [&*format!("  macbook  ↻ connected, but {detail}"), "  › notes   /src/notes"],
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_long_heading_is_cut_to_the_screen() {
+        let mut app = new_app(None);
+        app.update(Event::Server(ServerMsg::Welcome));
+        let detail =
+            "https://ghost.tail123b88.ts.net:4043/mcp: client error (Connect): dns error: failed to lookup address";
+        let listing = vec![machine("ghost", MachineStatus::Unreachable { detail: detail.into() }, vec![])];
+        app.update(Event::Server(ServerMsg::Reply { id: CallId(1), result: Ok(Reply::Projects(listing)) }));
+        let rows = screen(&app, 60, 10);
+        let heading = rows_after(&rows, "Projects")[0].to_owned();
+        assert!(heading.starts_with("  ghost  ✗ unreachable: https://ghost") && heading.ends_with('…'), "{rows}");
+        assert!(heading.width() <= 60, "{rows}");
+    }
+
+    #[test]
+    fn the_breadcrumb_names_the_machine_only_beside_others() {
+        assert!(screen(&pane_app(), 140, 10).contains("seirei › seirei-code"), "local alone needs no name");
+        let mut view = pane_view();
+        view.machine = MachineId::parse("studio").unwrap();
+        assert!(screen(&app_in_project(view), 140, 10).contains("seirei › studio › seirei-code"));
     }
 
     #[test]
