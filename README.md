@@ -125,3 +125,13 @@ Without `coordinator_model`, a new coordinator runs on the project's default mod
 ## How it works
 
 [docs/architecture.md](docs/architecture.md) covers the daemon, the socket protocol, sync, and how seirei finds a coordinator's jobs.
+
+## Develop
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+There is no CI on GitHub. Run these three on your computer before you merge a pull request. Nothing else checks it. The release workflow still builds the macOS archive when a `v*` tag is pushed.
